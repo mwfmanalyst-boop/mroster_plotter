@@ -1046,56 +1046,6 @@ with st.sidebar:
                 st.success(f"Roster imported to Parquet. Rows: {len(raw)}")
 
     st.divider()
-    st.subheader("📤 Export Current View")
-    # Use the current top-of-page filters (center, langs_sel, start, end, view_type)
-    exp_name = f"{center}_{view_type.replace(' ', '_')}_{start:%Y%m%d}_{end:%Y%m%d}.xlsx"
-
-    # Build the file on click (avoids heavy work unless requested)
-    if st.button("Build Excel", type="primary", use_container_width=True):
-        try:
-            xlsx_bytes = export_excel(
-                view_type=view_type,
-                center=center,
-                languages_sel=langs_sel,
-                start=start,
-                end=end,
-                records=records,
-                roster=roster,
-            )
-            st.session_state["last_export_bytes"] = xlsx_bytes
-            st.success("Excel generated.")
-        except Exception as e:
-            st.error(f"Export failed: {e}")
-
-    # Offer download if we have a built file
-    if "last_export_bytes" in st.session_state:
-        st.download_button(
-            "⬇️ Download Excel",
-            data=st.session_state["last_export_bytes"],
-            file_name=exp_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-        # Optional: also push the same file to Google Drive
-        if st.checkbox("Also upload to Drive (same folder as DB)"):
-
-            if st.button("📤 Upload to Drive", use_container_width=True):
-                try:
-                    service = _get_drive_service()
-                    file_id = _drive_find_file_id(service, exp_name, DRIVE_FOLDER_ID or None)
-                    up_id = _drive_upload_bytes(
-                        service=service,
-                        name=exp_name,
-                        data=st.session_state["last_export_bytes"],
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        folder_id=DRIVE_FOLDER_ID or None,
-                        file_id=file_id,  # update if already exists
-                    )
-                    st.success(f"Uploaded to Drive (file id: {up_id}).")
-                except Exception as e:
-                    st.error(f"Drive upload failed: {e}")
-
 # ========== Top filter row (union of centers/languages) ==========
 c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.3, 1.7])
 with c1:
@@ -1116,6 +1066,54 @@ with c4:
         lang_choices,
         default=(lang_choices if lang_choices else []),
     )
+# >>> EXPORT SIDEBAR (depends on center, view_type, start, end, langs_sel) <<<
+with st.sidebar:
+    st.divider()
+    st.subheader("📤 Export Current View")
+
+    exp_name = f"{center}_{view_type.replace(' ', '_')}_{start:%Y%m%d}_{end:%Y%m%d}.xlsx"
+
+    if st.button("Build Excel", type="primary", use_container_width=True):
+        try:
+            xlsx_bytes = export_excel(
+                view_type=view_type,
+                center=center,
+                languages_sel=langs_sel,
+                start=start,
+                end=end,
+                records=records,
+                roster=roster,
+            )
+            st.session_state["last_export_bytes"] = xlsx_bytes
+            st.success("Excel generated.")
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+
+    if "last_export_bytes" in st.session_state:
+        st.download_button(
+            "⬇️ Download Excel",
+            data=st.session_state["last_export_bytes"],
+            file_name=exp_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        if st.checkbox("Also upload to Drive (same folder as DB)"):
+            if st.button("📤 Upload to Drive", use_container_width=True):
+                try:
+                    service = _get_drive_service()
+                    file_id = _drive_find_file_id(service, exp_name, DRIVE_FOLDER_ID or None)
+                    up_id = _drive_upload_bytes(
+                        service=service,
+                        name=exp_name,
+                        data=st.session_state["last_export_bytes"],
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        folder_id=DRIVE_FOLDER_ID or None,
+                        file_id=file_id,
+                    )
+                    st.success(f"Uploaded to Drive (file id: {up_id}).")
+                except Exception as e:
+                    st.error(f"Drive upload failed: {e}")
 
 st.divider()
 
