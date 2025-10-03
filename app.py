@@ -982,29 +982,13 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.subheader("🧪 Data Check")
-    st.write(f"**records rows:** {diags.get('records_rows')}")
-    st.write(f"**roster_long rows:** {diags.get('roster_rows')}")
+    st.subheader("🧪 Data In Database ")
+    st.write(f"**Records_Data:** {diags.get('records_rows')}")
+    st.write(f"**Roster_Data:** {diags.get('roster_rows')}")
     if diags.get("note"): st.caption(f"_note_: {diags.get('note')}")
 
     if (records.empty) and (roster.empty):
         st.warning("Both `records` and `roster_long` are empty. Check filename, file/folder access, and table schemas.")
-
-    with st.expander("🔍 List files in DRIVE_FOLDER_ID"):
-        fid = DRIVE_FOLDER_ID
-        if not fid:
-            st.warning("DRIVE_FOLDER_ID is empty.")
-        else:
-            try:
-                svc = _get_drive_service()
-                items = _drive_list_folder(svc, fid)
-                if not items:
-                    st.info("No items visible to the service account in this folder.")
-                else:
-                    for f in items:
-                        st.write(f"- **{f.get('name')}** (`{f.get('id')}`)")
-            except Exception as e:
-                st.error(f"List error: {e}")
 
     st.divider()
     st.subheader("⬆️ Import Files (Excel)")
