@@ -490,6 +490,10 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
         for c in ["AgentID","Language","Center","LOB","Shift"]:
             if c in roster.columns:
                 roster[c] = roster[c].astype(str).str.strip()
+                if "Shift" in roster.columns:
+                    roster["Shift"] = roster["Shift"].apply(
+                        lambda s: (_normalize_shift_label(s) or str(s).strip().upper())
+                    )
     return records, roster, diags
 
 # =========================
@@ -641,36 +645,80 @@ def roster_nonshift_codes(roster: pd.DataFrame, center: Optional[str], start: da
             vals.append(t)
     return sorted(dict.fromkeys(vals), key=lambda x: x.upper())
 
-def pivot_roster_counts(roster, center, languages_, start, end) -> pd.DataFrame:
-    if roster.empty or not languages_: return pd.DataFrame()
-    df = roster[(roster["Date"].between(start, end)) & (roster["Language"].isin(languages_))].copy()
-    if center != "Overall": df = df[df["Center"] == center]
-    if df.empty: return pd.DataFrame()
-    time_rows, code_rows = [], []
-    time_pat = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
-    for _, row in df.iterrows():
-        dt = row["Date"]; s = str(row["Shift"]).strip().upper()
-        if s in {"WO","CL"}:
-            code_rows.append((dt, s)); continue
-        if time_pat.fullmatch(s):
-            for part in [p.strip() for p in s.split("/") if p.strip()]:
-                if re.fullmatch(r"\d{4}-\d{4}", part):
-                    time_rows.append((dt, part))
+def pivot_roster_counts(roster: pd.DataFrame,
+                        center: Optional[str],
+                        languages_: List[str],
+                        start: date,
+                        end: date) -> pd.DataFrame:
+    """
+    Desktop-equivalent counting:
+      - Accepts time-like shifts in many formats via _normalize_shift_label()
+      - Splits combined shifts (e.g., 0900-1300/1400-1800) and counts each part
+      - WO and CL are aggregated into a single 'WO+CL' row
+      - Returns a Shift x Date pivot of float counts
+    """
+    if roster.empty or not languages_:
+        return pd.DataFrame()
 
+    # Filter
+    df = roster[roster["Date"].between(start, end)].copy()
+    if center and center != "Overall":
+        df = df[df["Center"] == center]
+    df = df[df["Language"].isin(languages_)]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Count rows: time-like vs WO/CL codes (normalize first)
+    time_rows: list[tuple[date, str]] = []
+    code_rows: list[tuple[date, str]] = []
+
+    for _, row in df.iterrows():
+        dt = row["Date"]
+        raw = str(row.get("Shift", "")).strip()
+
+        # Normalize exactly like desktop
+        norm = _normalize_shift_label(raw)
+        if not norm:
+            # not a recognized time-like shift and not an off-code -> ignore
+            continue
+
+        if norm in {"WO", "CL", "WO+CL"}:
+            # treat both WO and CL and WO+CL as off-codes; they'll be combined below
+            # store original norm (WO or CL). 'WO+CL' also safe here.
+            code_rows.append((dt, "WO" if norm == "WO" else ("CL" if norm == "CL" else "WO+CL")))
+            continue
+
+        # norm is either a single '####-####' or a combined '####-####/####-####'
+        parts = [p.strip() for p in str(norm).split("/") if p.strip()]
+        for p in parts:
+            # defensive: keep only proper single parts
+            if re.fullmatch(r"\d{4}-\d{4}", p):
+                time_rows.append((dt, p))
+
+    # Build pivot for time-like rows
     p = pd.DataFrame()
     if time_rows:
-        tdf = pd.DataFrame(time_rows, columns=["Date","Shift"])
-        p = tdf.groupby(["Shift","Date"]).size().unstack("Date", fill_value=0).astype(float)
+        tdf = pd.DataFrame(time_rows, columns=["Date", "Shift"])
+        p = tdf.groupby(["Shift", "Date"]).size().unstack("Date", fill_value=0).astype(float)
+        # sort columns by date asc
         p = p.reindex(sorted(p.columns), axis=1)
+
+    # Build/off-codes as single 'WO+CL' row
     if code_rows:
-        cdf = pd.DataFrame(code_rows, columns=["Date","Code"])
-        codes = cdf.groupby(["Date","Code"]).size().unstack("Code", fill_value=0)
-        wocl = (codes.get("WO", 0) + codes.get("CL", 0)).astype(float)
+        cdf = pd.DataFrame(code_rows, columns=["Date", "Code"])
+        # count WO and CL (and possible WO+CL) per date, then fold into a single WO+CL total
+        codes = cdf.groupby(["Date", "Code"]).size().unstack("Code", fill_value=0)
+        w = codes.get("WO", 0)
+        c = codes.get("CL", 0)
+        wc = codes.get("WO+CL", 0)
+        wocl = (w + c + wc).astype(float)
+
+        # align with time pivot columns
         all_cols = sorted(set(p.columns) | set(wocl.index.tolist()))
         p = (pd.DataFrame(columns=all_cols) if p.empty else p.reindex(columns=all_cols, fill_value=0.0))
-        p.loc["WO+CL"] = [float(wocl.get(c, 0.0)) for c in p.columns]
+        p.loc["WO+CL"] = [float(wocl.get(col, 0.0)) for col in p.columns]
 
-    p.index.name = "Shift"             # <-- add this
+    p.index.name = "Shift"
     return p
 
 def add_total_row(df: pd.DataFrame) -> pd.DataFrame:
@@ -985,7 +1033,7 @@ with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
 # =========================
 # Tabs: Dashboard | Plotter | Roster
 # =========================
-tab_dash, tab_plot, tab_roster, tab_req = st.tabs(["Dashboard", "Plotter", "Roster", "Requested"])
+tab_dash, tab_plot, tab_roster, tab_req = st.tabs(["Dashboard", "Plotter", "Roster"])
 
 
 with tab_dash:
@@ -1235,5 +1283,4 @@ with tab_roster:
                     st.success(msg)
                 else:
                     st.info(msg)
-
 
