@@ -29,15 +29,102 @@ st.set_page_config(
 # -----------------------------
 # Helpers: Google Drive Storage
 # -----------------------------
+# ---------- Drive helpers (replace your current ones) ----------
 def _get_drive_service():
-    """Create a Drive service using the service account in Streamlit secrets."""
-    info = st.secrets.get("gcp_service_account", None)
+    info = st.secrets.get("gcp_service_account")
     if not info:
-        st.error("Google Drive auth failed. Please add service account JSON to st.secrets['gcp_service_account'].")
-        raise RuntimeError("Missing gcp_service_account in secrets.")
+        st.error("Missing st.secrets['gcp_service_account']")
+        raise RuntimeError("No service account")
     scopes = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
+
+def _drive_resolve_shortcut(service, file_obj):
+    # If it's a shortcut, resolve to its targetId
+    if file_obj.get("mimeType") == "application/vnd.google-apps.shortcut":
+        target_id = file_obj.get("shortcutDetails", {}).get("targetId")
+        if target_id:
+            return service.files().get(fileId=target_id,
+                                       fields="id, name, parents, mimeType, driveId",
+                                       supportsAllDrives=True).execute()
+    return file_obj
+
+def _drive_get_file_by_id(service, file_id: str):
+    return service.files().get(fileId=file_id,
+                               fields="id, name, parents, mimeType, driveId, shortcutDetails",
+                               supportsAllDrives=True).execute()
+
+def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
+    """
+    Find a file by exact name (and parent folder if provided). Works across My Drive & Shared Drives.
+    Also resolves Google Drive shortcuts.
+    """
+    params = {
+        "q": f"name = '{name}' and trashed = false",
+        "fields": "files(id, name, parents, mimeType, driveId, shortcutDetails)",
+        "pageSize": 50,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "corpora": "allDrives",
+    }
+    if folder_id:
+        params["q"] = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
+
+    resp = service.files().list(**params).execute()
+    files = resp.get("files", [])
+    if not files:
+        return None
+
+    # Prefer an exact match inside the folder; resolve shortcuts
+    for f in files:
+        f = _drive_resolve_shortcut(service, f)
+        if not folder_id or (folder_id in (f.get("parents") or [])):
+            return f["id"]
+
+    # fallback: first match
+    return _drive_resolve_shortcut(service, files[0])["id"]
+
+def _drive_download_bytes(service, file_id: str) -> bytes:
+    req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: Optional[str], file_id: Optional[str] = None) -> str:
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    if file_id:
+        file = service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+        return file["id"]
+    meta = {"name": name}
+    if folder_id:
+        meta["parents"] = [folder_id]
+    file = service.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
+    return file["id"]
+
+def _drive_list_folder(service, folder_id: str) -> list[dict]:
+    """List files visible to the service account inside a folder (resolves shortcuts)."""
+    items = []
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType, shortcutDetails)",
+            pageSize=200,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            corpora="allDrives"
+        ).execute()
+        for f in resp.get("files", []):
+            items.append(_drive_resolve_shortcut(service, f))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+# ---------------------------------------------------------------
 
 def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
     """Find a file by exact name (and parent folder if provided). Returns file id or None."""
@@ -101,13 +188,32 @@ def save_parquet_to_drive(name: str, df: pd.DataFrame):
 DUCKDB_FILE_NAME = st.secrets.get("DUCKDB_FILE_NAME", None)  # e.g., "cmb_delta.duckdb"
 
 def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Download DuckDB file from Drive to a temp path (read-write). Returns (local_path, file_id, error_msg)."""
+    """
+    Download DuckDB file to temp; return (local_path, file_id, error).
+    Tries DUCKDB_FILE_ID first; then finds by name in DRIVE_FOLDER_ID (or all drives).
+    """
     try:
         service = _get_drive_service()
         folder_id = st.secrets.get("DRIVE_FOLDER_ID")
+        file_id_from_secret = st.secrets.get("DUCKDB_FILE_ID", "").strip()
+
+        # Prefer explicit file ID
+        if file_id_from_secret:
+            try:
+                f = _drive_get_file_by_id(service, file_id_from_secret)
+                f = _drive_resolve_shortcut(service, f)
+                raw = _drive_download_bytes(service, f["id"])
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
+                tmp.write(raw); tmp.flush(); tmp.close()
+                return tmp.name, f["id"], None
+            except Exception as e:
+                return None, None, f"DUCKDB_FILE_ID lookup failed: {e}"
+
+        # Else search by name
         file_id = _drive_find_file_id(service, name, folder_id)
         if not file_id:
-            return None, None, f"File '{name}' not found in folder {folder_id}."
+            folder_txt = folder_id if folder_id else "all drives visible to the service account"
+            return None, None, f"File '{name}' not found in {folder_txt}."
         raw = _drive_download_bytes(service, file_id)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
         tmp.write(raw); tmp.flush(); tmp.close()
@@ -728,6 +834,21 @@ with st.sidebar:
     if diags.get("note"): st.caption(f"_note_: {diags.get('note')}")
     if (records.empty) and (roster.empty):
         st.warning("Both `records` and `roster_long` are empty. Check filename, permissions, and table schemas.")
+    with st.expander("🔍 List files in DRIVE_FOLDER_ID"):
+        folder_id_dbg = st.secrets.get("DRIVE_FOLDER_ID", "")
+        if not folder_id_dbg:
+            st.warning("DRIVE_FOLDER_ID is empty.")
+        else:
+            try:
+                svc = _get_drive_service()
+                items = _drive_list_folder(svc, folder_id_dbg)
+                if not items:
+                    st.info("No items visible to the service account in this folder.")
+                else:
+                    for f in items:
+                        st.write(f"- **{f.get('name')}**  (`{f.get('id')}`)")
+            except Exception as e:
+                st.error(f"List error: {e}")
 
     st.divider()
     st.subheader("⬆️ Import Files (Excel)")
