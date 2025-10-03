@@ -983,12 +983,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🧪 Data Check")
-    st.write(f"**Source:** {diags.get('source')}")
-    st.write(f"**Service account:** {diags.get('sa_email', SA_INFO.get('client_email','<unknown>'))}")
-    st.write(f"**DRIVE_FOLDER_ID:** {diags.get('folder_id')}")
-    st.write(f"**DuckDB file name:** {diags.get('db_file')}")
-    st.write(f"**DUCKDB_FILE_ID:** {diags.get('file_id')}")
-    st.write(f"**Found in Drive?** {'✅ Yes' if diags.get('found')=='yes' else '❌ No'}")
     st.write(f"**records rows:** {diags.get('records_rows')}")
     st.write(f"**roster_long rows:** {diags.get('roster_rows')}")
     if diags.get("note"): st.caption(f"_note_: {diags.get('note')}")
