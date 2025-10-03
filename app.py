@@ -1,3 +1,4 @@
+# app.py
 import io
 import re
 import json
@@ -21,68 +22,65 @@ import duckdb
 # =========================
 # Page + Global Config
 # =========================
-st.set_page_config(
-    page_title="Center Shiftwise Web Dashboard",
-    layout="wide",
-)
+st.set_page_config(page_title="Center Shiftwise Web Dashboard", layout="wide")
 
-# -----------------------------
-# Helpers: Google Drive Storage
-# -----------------------------
-# ---------- Drive helpers (replace your current ones) ----------
+# =========================
+# Secrets (read once)
+# =========================
+SA_INFO = st.secrets.get("gcp_service_account", {})
+DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "").strip()
+DUCKDB_FILE_NAME = st.secrets.get("DUCKDB_FILE_NAME", "").strip() or "cmb_delta.duckdb"
+DUCKDB_FILE_ID = st.secrets.get("DUCKDB_FILE_ID", "").strip()  # optional but best
+
+# =========================
+# Google Drive helpers (Shared-Drive aware + shortcut-safe)
+# =========================
 def _get_drive_service():
-    info = st.secrets.get("gcp_service_account")
-    if not info:
-        st.error("Missing st.secrets['gcp_service_account']")
-        raise RuntimeError("No service account")
+    if not SA_INFO:
+        st.error("Missing st.secrets['gcp_service_account']. Add your service account JSON.")
+        raise RuntimeError("No service account in secrets")
     scopes = ['https://www.googleapis.com/auth/drive']
-    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    creds = service_account.Credentials.from_service_account_info(SA_INFO, scopes=scopes)
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def _drive_resolve_shortcut(service, file_obj):
-    # If it's a shortcut, resolve to its targetId
     if file_obj.get("mimeType") == "application/vnd.google-apps.shortcut":
         target_id = file_obj.get("shortcutDetails", {}).get("targetId")
         if target_id:
             return service.files().get(fileId=target_id,
-                                       fields="id, name, parents, mimeType, driveId",
+                                       fields="id,name,parents,mimeType,driveId",
                                        supportsAllDrives=True).execute()
     return file_obj
 
 def _drive_get_file_by_id(service, file_id: str):
-    return service.files().get(fileId=file_id,
-                               fields="id, name, parents, mimeType, driveId, shortcutDetails",
-                               supportsAllDrives=True).execute()
+    return service.files().get(
+        fileId=file_id,
+        fields="id,name,parents,mimeType,driveId,shortcutDetails",
+        supportsAllDrives=True
+    ).execute()
 
 def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
-    """
-    Find a file by exact name (and parent folder if provided). Works across My Drive & Shared Drives.
-    Also resolves Google Drive shortcuts.
-    """
-    params = {
-        "q": f"name = '{name}' and trashed = false",
-        "fields": "files(id, name, parents, mimeType, driveId, shortcutDetails)",
-        "pageSize": 50,
-        "supportsAllDrives": True,
-        "includeItemsFromAllDrives": True,
-        "corpora": "allDrives",
-    }
+    """Find file by exact name (optionally inside folder). Works on Shared Drives and resolves shortcuts."""
+    q = f"name = '{name}' and trashed = false"
     if folder_id:
-        params["q"] = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
-
-    resp = service.files().list(**params).execute()
+        q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
+    resp = service.files().list(
+        q=q,
+        fields="files(id,name,parents,mimeType,shortcutDetails,driveId)",
+        pageSize=50,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        corpora="allDrives",
+    ).execute()
     files = resp.get("files", [])
     if not files:
         return None
-
-    # Prefer an exact match inside the folder; resolve shortcuts
-    for f in files:
-        f = _drive_resolve_shortcut(service, f)
-        if not folder_id or (folder_id in (f.get("parents") or [])):
-            return f["id"]
-
-    # fallback: first match
-    return _drive_resolve_shortcut(service, files[0])["id"]
+    files = [_drive_resolve_shortcut(service, f) for f in files]
+    if folder_id:
+        for f in files:
+            if folder_id in (f.get("parents") or []):
+                return f["id"]
+    return files[0]["id"]
 
 def _drive_download_bytes(service, file_id: str) -> bytes:
     req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -105,13 +103,12 @@ def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: O
     return file["id"]
 
 def _drive_list_folder(service, folder_id: str) -> list[dict]:
-    """List files visible to the service account inside a folder (resolves shortcuts)."""
     items = []
     page_token = None
     while True:
         resp = service.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
-            fields="nextPageToken, files(id, name, mimeType, shortcutDetails)",
+            fields="nextPageToken, files(id,name,mimeType,shortcutDetails)",
             pageSize=200,
             pageToken=page_token,
             supportsAllDrives=True,
@@ -124,46 +121,15 @@ def _drive_list_folder(service, folder_id: str) -> list[dict]:
         if not page_token:
             break
     return items
-# ---------------------------------------------------------------
 
-def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
-    """Find a file by exact name (and parent folder if provided). Returns file id or None."""
-    if folder_id:
-        q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
-    else:
-        q = f"name = '{name}' and trashed = false"
-    resp = service.files().list(q=q, fields="files(id, name)", pageSize=10).execute()
-    files = resp.get("files", [])
-    return files[0]["id"] if files else None
-
-def _drive_download_bytes(service, file_id: str) -> bytes:
-    req = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
-
-def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: Optional[str], file_id: Optional[str] = None) -> str:
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
-    if file_id:
-        file = service.files().update(fileId=file_id, media_body=media).execute()
-        return file["id"]
-    else:
-        meta = {"name": name}
-        if folder_id:
-            meta["parents"] = [folder_id]
-        file = service.files().create(body=meta, media_body=media, fields="id").execute()
-        return file["id"]
-
-# ===== Parquet helpers (fallback store) =====
+# ===== Parquet helpers (fallback store, if you ever want it) =====
 @st.cache_data(ttl=300)
 def load_parquet_from_drive(name: str) -> pd.DataFrame:
     service = _get_drive_service()
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID")
+    folder_id = DRIVE_FOLDER_ID or None
     file_id = _drive_find_file_id(service, name, folder_id)
-    if not file_id: return pd.DataFrame()
+    if not file_id:
+        return pd.DataFrame()
     raw = _drive_download_bytes(service, file_id)
     try:
         return pd.read_parquet(io.BytesIO(raw))
@@ -175,32 +141,28 @@ def load_parquet_from_drive(name: str) -> pd.DataFrame:
 
 def save_parquet_to_drive(name: str, df: pd.DataFrame):
     service = _get_drive_service()
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID")
+    folder_id = DRIVE_FOLDER_ID or None
     file_id = _drive_find_file_id(service, name, folder_id)
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
     _drive_upload_bytes(service, name, buf.getvalue(), "application/vnd.apache.parquet", folder_id, file_id)
     load_parquet_from_drive.clear()
 
-# -----------------------------
+# =========================
 # DuckDB Load/Save (from/to Drive)
-# -----------------------------
-DUCKDB_FILE_NAME = st.secrets.get("DUCKDB_FILE_NAME", None)  # e.g., "cmb_delta.duckdb"
-
+# =========================
 def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Download DuckDB file to temp; return (local_path, file_id, error).
-    Tries DUCKDB_FILE_ID first; then finds by name in DRIVE_FOLDER_ID (or all drives).
+    Download DuckDB file to a temp path; return (local_path, file_id, error).
+    Prefers DUCKDB_FILE_ID. Otherwise searches by name in DRIVE_FOLDER_ID (or all drives visible).
     """
     try:
         service = _get_drive_service()
-        folder_id = st.secrets.get("DRIVE_FOLDER_ID")
-        file_id_from_secret = st.secrets.get("DUCKDB_FILE_ID", "").strip()
 
-        # Prefer explicit file ID
-        if file_id_from_secret:
+        # Prefer explicit file ID if present (bypasses all name/folder/shortcut issues)
+        if DUCKDB_FILE_ID:
             try:
-                f = _drive_get_file_by_id(service, file_id_from_secret)
+                f = _drive_get_file_by_id(service, DUCKDB_FILE_ID)
                 f = _drive_resolve_shortcut(service, f)
                 raw = _drive_download_bytes(service, f["id"])
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
@@ -209,11 +171,11 @@ def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str], Option
             except Exception as e:
                 return None, None, f"DUCKDB_FILE_ID lookup failed: {e}"
 
-        # Else search by name
-        file_id = _drive_find_file_id(service, name, folder_id)
+        # Else search by name (optionally within folder)
+        file_id = _drive_find_file_id(service, name, DRIVE_FOLDER_ID or None)
         if not file_id:
-            folder_txt = folder_id if folder_id else "all drives visible to the service account"
-            return None, None, f"File '{name}' not found in {folder_txt}."
+            where = DRIVE_FOLDER_ID or "all drives visible to the service account"
+            return None, None, f"File '{name}' not found in {where}."
         raw = _drive_download_bytes(service, file_id)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
         tmp.write(raw); tmp.flush(); tmp.close()
@@ -225,21 +187,29 @@ def _upload_duckdb_back(local_path: str, file_id: str, name: str):
     service = _get_drive_service()
     with open(local_path, "rb") as f:
         data = f.read()
-    _drive_upload_bytes(service, name, data, "application/octet-stream", st.secrets.get("DRIVE_FOLDER_ID"), file_id)
+    _drive_upload_bytes(service, name, data, "application/octet-stream", DRIVE_FOLDER_ID or None, file_id)
 
 @st.cache_data(ttl=300)
 def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     """
-    Download db_name from Drive and read expected tables into DataFrames (read-only).
-    Returns (records_df, roster_df, diagnostics).
+    Read DuckDB tables into DataFrames. Returns (records, roster_long, diagnostics)
     """
-    diags = {"db_file": db_name, "found": "no", "records_rows": "0", "roster_rows": "0", "note": ""}
+    diags = {
+        "db_file": db_name,
+        "found": "no",
+        "records_rows": "0",
+        "roster_rows": "0",
+        "note": "",
+        "folder_id": DRIVE_FOLDER_ID or "(empty)",
+        "file_id": DUCKDB_FILE_ID or "(not set)",
+        "sa_email": SA_INFO.get("client_email", "<unknown>"),
+    }
     local_path, file_id, err = _download_duckdb_rw(db_name)
     if err:
         diags["note"] = err
         return pd.DataFrame(), pd.DataFrame(), diags
-    diags["found"] = "yes"
 
+    diags["found"] = "yes"
     try:
         con = duckdb.connect(local_path, read_only=True)
     except Exception as e:
@@ -249,8 +219,7 @@ def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str
     # records
     try:
         df_records = con.execute("""
-            SELECT Center, Language, Shift, Metric, Date, Value
-            FROM records
+            SELECT Center, Language, Shift, Metric, Date, Value FROM records
         """).df()
     except Exception:
         try:
@@ -282,31 +251,16 @@ def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str
 def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
     con.execute("""
         CREATE TABLE IF NOT EXISTS records (
-            Center VARCHAR,
-            Language VARCHAR,
-            Shift VARCHAR,
-            Metric VARCHAR,
-            Date DATE,
-            Value DOUBLE
+            Center VARCHAR, Language VARCHAR, Shift VARCHAR,
+            Metric VARCHAR, Date DATE, Value DOUBLE
         );
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS roster_long (
-            AgentID VARCHAR,
-            EmpID VARCHAR,
-            AgentName VARCHAR,
-            TLName VARCHAR,
-            Status VARCHAR,
-            WorkMode VARCHAR,
-            Center VARCHAR,
-            Location VARCHAR,
-            Language VARCHAR,
-            SecondaryLanguage VARCHAR,
-            LOB VARCHAR,
-            FTPT VARCHAR,
-            BaseShift VARCHAR,
-            Date DATE,
-            Shift VARCHAR
+            AgentID VARCHAR, EmpID VARCHAR, AgentName VARCHAR, TLName VARCHAR,
+            Status VARCHAR, WorkMode VARCHAR, Center VARCHAR, Location VARCHAR,
+            Language VARCHAR, SecondaryLanguage VARCHAR, LOB VARCHAR, FTPT VARCHAR,
+            BaseShift VARCHAR, Date DATE, Shift VARCHAR
         );
     """)
 
@@ -331,8 +285,7 @@ def duckdb_upsert_records(local_db_path: str, file_id: str, name_in_drive: str, 
            AND t.Shift = s.Shift
            AND t.Date = s.Date
         WHEN MATCHED THEN UPDATE SET
-            Metric = s.Metric,
-            Value  = s.Value
+            Metric = s.Metric, Value = s.Value
         WHEN NOT MATCHED THEN INSERT (Center, Language, Shift, Metric, Date, Value)
         VALUES (s.Center, s.Language, s.Shift, s.Metric, s.Date, s.Value);
     """)
@@ -362,8 +315,7 @@ def duckdb_replace_roster(local_db_path: str, file_id: str, name_in_drive: str, 
 def _is_date_like(x) -> bool:
     try:
         if pd.isna(x): return False
-        pd.to_datetime(x)
-        return True
+        pd.to_datetime(x); return True
     except Exception:
         return False
 
@@ -400,11 +352,8 @@ def _collect_contiguous_dates_in_row(df: pd.DataFrame, row: int, start_col: int)
 
 SHIFT_SPLIT = re.compile(r"\s*/\s*")
 WOCL_VARIANTS = re.compile(r"^\s*W\s*O\s*[\+&/ ]\s*C\s*L\s*$", re.I)
-TIME_RANGE_RE = re.compile(
-    r"""^\s*(?:(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))
-        (?:\s*/\s*(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))*\s*$""",
-    re.X
-)
+TIME_RANGE_RE = re.compile(r"""^\s*(?:(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))
+                                (?:\s*/\s*(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))*\s*$""", re.X)
 
 def _is_off_code(s: str) -> Optional[str]:
     t = re.sub(r"\s+", "", str(s)).upper()
@@ -492,7 +441,7 @@ def read_roster_sheet(file_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
 # =========================
-# Data model selection (DuckDB preferred)
+# Data model selection (prefer DuckDB)
 # =========================
 RECORDS_FILE = "records.parquet"
 ROSTER_FILE  = "roster_long.parquet"
@@ -504,32 +453,31 @@ def _centers_union(records: pd.DataFrame, roster: pd.DataFrame) -> List[str]:
     return ["Overall"] + cs
 
 def _languages_union(records: pd.DataFrame, roster: pd.DataFrame, center: Optional[str]) -> List[str]:
+    def unique_lang(df):
+        return set(df["Language"].dropna().astype(str).str.strip().unique().tolist()) if not df.empty and "Language" in df else set()
     if center in (None, "", "Overall"):
-        a = set(records["Language"].unique().tolist()) if not records.empty and "Language" in records else set()
-        b = set(roster["Language"].unique().tolist())  if not roster.empty  and "Language" in roster  else set()
+        return sorted([l for l in (unique_lang(records) | unique_lang(roster)) if l])
     else:
-        a = set(records.loc[records["Center"]==center, "Language"].unique().tolist()) if not records.empty and "Center" in records else set()
-        b = set(roster.loc[roster["Center"]==center, "Language"].unique().tolist())  if not roster.empty and "Center" in roster else set()
-    return sorted([l for l in (a | b) if l])
+        a = unique_lang(records[records["Center"]==center]) if "Center" in records else set()
+        b = unique_lang(roster[roster["Center"]==center]) if "Center" in roster else set()
+        return sorted([l for l in (a | b) if l])
 
 def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
-    """
-    Prefer DuckDB if DUCKDB_FILE_NAME is set; else load Parquet files.
-    Metric handling is tolerant: only filter to 'Requested' if present.
-    Returns (records, roster, diagnostics)
-    """
-    diags = {"source":"parquet"}
+    diags = {}
     if DUCKDB_FILE_NAME:
         records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME)
         diags.update({"source":"duckdb", **d})
     else:
         records = load_parquet_from_drive(RECORDS_FILE)
         roster  = load_parquet_from_drive(ROSTER_FILE)
-        diags.update({"records_rows":str(0 if records.empty else len(records)),
-                      "roster_rows": str(0 if roster.empty  else len(roster)),
-                      "found":"n/a","db_file":"n/a","note":""})
+        diags.update({"source":"parquet",
+                      "records_rows":str(0 if records.empty else len(records)),
+                      "roster_rows": str(0 if roster.empty else len(roster)),
+                      "found":"n/a","db_file":"n/a","note":"",
+                      "folder_id": DRIVE_FOLDER_ID or "(empty)",
+                      "file_id": DUCKDB_FILE_ID or "(not set)",
+                      "sa_email": SA_INFO.get("client_email","<unknown>")})
 
-    # Normalize / filter
     if not records.empty:
         records["Date"] = pd.to_datetime(records["Date"]).dt.date
         if "Metric" not in records or records["Metric"].isna().all():
@@ -542,17 +490,14 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
         for c in ["AgentID","Language","Center","LOB","Shift"]:
             if c in roster.columns:
                 roster[c] = roster[c].astype(str).str.strip()
-
     return records, roster, diags
 
 # =========================
 # Aggregation + Views
 # =========================
 def _pretty_int(x: float) -> int:
-    try:
-        return int(round(float(x)))
-    except Exception:
-        return 0
+    try: return int(round(float(x)))
+    except Exception: return 0
 
 _TIME_RE_SINGLE = re.compile(r"^\d{4}-\d{4}$")
 
@@ -560,8 +505,7 @@ def _minutes_of(label: str) -> Optional[int]:
     s = str(label).strip()
     if not _TIME_RE_SINGLE.fullmatch(s): return None
     sh, sm, eh, em = int(s[0:2]), int(s[2:4]), int(s[5:7]), int(s[7:9])
-    start = sh*60 + sm
-    end   = eh*60 + em
+    start = sh*60 + sm; end = eh*60 + em
     return (end - start) if end > start else None
 
 def dedup_requested_split_pairs(pivot_df: pd.DataFrame) -> pd.DataFrame:
@@ -601,23 +545,20 @@ def transform_to_interval_view(shift_df: pd.DataFrame) -> pd.DataFrame:
         if end_min <= start_min: return
         if to_date not in interval_df.columns: interval_df[to_date] = 0.0
         for h in range(24):
-            h_start, h_end = h*60, (h+1)*60
-            dur = max(0, min(end_min, h_end) - max(start_min, h_start))
+            dur = max(0, min(end_min, (h+1)*60) - max(start_min, h*60))
             if dur > 0:
                 interval_df.at[h, to_date] += float(counts) * (dur / 60.0)
     for shift_label, counts_series in shift_df.iterrows():
         if str(shift_label).upper() in {"WO","CL","WO+CL"}: continue
         for part in str(shift_label).split("/"):
             part = part.strip()
-            pair = None
             if re.fullmatch(r"\d{4}-\d{4}", part):
                 smin = int(part[:2]) * 60 + int(part[2:4])
                 emin = int(part[5:7]) * 60 + int(part[7:9])
-                pair = (smin, emin)
             else:
                 pair = _minutes_pair(part)
-            if not pair: continue
-            smin, emin = pair
+                if not pair: continue
+                smin, emin = pair
             for day, count in counts_series.items():
                 if pd.isna(count) or float(count) == 0.0: continue
                 if emin > smin:
@@ -629,7 +570,7 @@ def transform_to_interval_view(shift_df: pd.DataFrame) -> pd.DataFrame:
     return interval_df.reindex(columns=final_cols, fill_value=0.0)
 
 # =========================
-# Query utilities (pandas)
+# Query utilities
 # =========================
 def union_dates(records: pd.DataFrame, roster: pd.DataFrame, center: Optional[str]) -> List[date]:
     rs = set()
@@ -653,8 +594,7 @@ def roster_lobs(roster: pd.DataFrame, center: Optional[str], start: date, end: d
     if roster.empty or "LOB" not in roster.columns: return []
     df = roster[roster["Date"].between(start, end)]
     if center and center != "Overall": df = df[df["Center"] == center]
-    out = sorted([x for x in df["LOB"].dropna().astype(str).str.strip().unique().tolist() if x])
-    return out
+    return sorted([x for x in df["LOB"].dropna().astype(str).str.strip().unique().tolist() if x])
 
 def roster_languages_for_lob(roster: pd.DataFrame, center: Optional[str], lob: Optional[str], start: date, end: date) -> List[str]:
     if roster.empty: return []
@@ -781,7 +721,6 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
             ws = writer.sheets[sheet_name]
             for col_cells in ws.columns:
                 max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
-                from openpyxl.utils import get_column_letter
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
 
         if view_type in ["Interval_Wise Delta View", "Overall_Delta View"]:
@@ -800,7 +739,6 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
             ws = writer.sheets[sheet_name]
             for col_cells in ws.columns:
                 max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
-                from openpyxl.utils import get_column_letter
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
     return output.getvalue()
 
@@ -808,16 +746,16 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
 # UI
 # =========================
 st.title("📊 Center Shiftwise Web Dashboard")
-st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet (DuckDB read/write when configured)")
+st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet (Shared Drive compatible)")
 
-# Load store early for diagnostics
+# Load current store
 records, roster, diags = load_store()
 
 with st.sidebar:
     st.subheader("🔐 Google Drive Setup")
     st.write("- Add service account JSON to **st.secrets['gcp_service_account']**."
-             "\n- Set **st.secrets['DRIVE_FOLDER_ID']** to the folder that contains your data."
-             "\n- Optionally set **st.secrets['DUCKDB_FILE_NAME']** (e.g., `cmb_delta.duckdb`) for DuckDB read/write.")
+             "\n- Set **st.secrets['DRIVE_FOLDER_ID']** to the Shared Drive folder that contains your DB."
+             "\n- Optionally set **st.secrets['DUCKDB_FILE_ID']** to the file's ID to bypass name search.")
     if st.button("↻ Sync from Drive", use_container_width=True):
         load_parquet_from_drive.clear()
         load_from_duckdb.clear()
@@ -826,27 +764,31 @@ with st.sidebar:
     st.divider()
     st.subheader("🧪 Data Check")
     st.write(f"**Source:** {diags.get('source')}")
-    if diags.get("source") == "duckdb":
-        st.write(f"**DuckDB file name:** {diags.get('db_file')}")
-        st.write(f"**Found in Drive?** {'✅ Yes' if diags.get('found')=='yes' else '❌ No'}")
+    st.write(f"**Service account:** {diags.get('sa_email', SA_INFO.get('client_email','<unknown>'))}")
+    st.write(f"**DRIVE_FOLDER_ID:** {diags.get('folder_id')}")
+    st.write(f"**DuckDB file name:** {diags.get('db_file')}")
+    st.write(f"**DUCKDB_FILE_ID:** {diags.get('file_id')}")
+    st.write(f"**Found in Drive?** {'✅ Yes' if diags.get('found')=='yes' else '❌ No'}")
     st.write(f"**records rows:** {diags.get('records_rows')}")
     st.write(f"**roster_long rows:** {diags.get('roster_rows')}")
     if diags.get("note"): st.caption(f"_note_: {diags.get('note')}")
+
     if (records.empty) and (roster.empty):
-        st.warning("Both `records` and `roster_long` are empty. Check filename, permissions, and table schemas.")
+        st.warning("Both `records` and `roster_long` are empty. Check filename, file/folder access, and table schemas.")
+
     with st.expander("🔍 List files in DRIVE_FOLDER_ID"):
-        folder_id_dbg = st.secrets.get("DRIVE_FOLDER_ID", "")
-        if not folder_id_dbg:
+        fid = DRIVE_FOLDER_ID
+        if not fid:
             st.warning("DRIVE_FOLDER_ID is empty.")
         else:
             try:
                 svc = _get_drive_service()
-                items = _drive_list_folder(svc, folder_id_dbg)
+                items = _drive_list_folder(svc, fid)
                 if not items:
                     st.info("No items visible to the service account in this folder.")
                 else:
                     for f in items:
-                        st.write(f"- **{f.get('name')}**  (`{f.get('id')}`)")
+                        st.write(f"- **{f.get('name')}** (`{f.get('id')}`)")
             except Exception as e:
                 st.error(f"List error: {e}")
 
@@ -869,7 +811,6 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"DuckDB upsert failed: {e}")
             else:
-                # fallback to parquet store
                 cur = load_parquet_from_drive(RECORDS_FILE)
                 if cur.empty:
                     out = new_req
@@ -888,16 +829,12 @@ with st.sidebar:
         if raw.empty:
             st.warning("No Roster data found (need a 'Roster' sheet).")
         else:
-            # Minimal normalizer: keep as-is; just ensure Date/Shift exist in final table later.
-            # (If you used the advanced replace_roster before, you can plug it here.)
-            # For simplicity we *assume* your uploaded roster is already normalized like roster_long.
             if DUCKDB_FILE_NAME:
                 local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
                 if err or not local_db or not file_id:
                     st.error(f"DuckDB issue: {err or 'File not found.'}")
                 else:
                     try:
-                        # Try to coerce Date and Shift presence
                         if "Date" not in raw or "Shift" not in raw:
                             st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
                         else:
@@ -913,9 +850,7 @@ with st.sidebar:
     st.divider()
     st.subheader("📤 Export Current View")
 
-# =========================
-# Top filter row (now using UNION of centers/languages)
-# =========================
+# ========== Top filter row (union of centers/languages) ==========
 c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.3, 1.7])
 with c1:
     center_vals = _centers_union(records, roster)
@@ -930,8 +865,7 @@ with c3:
     view_type = st.selectbox("View", ["Shift_Wise Delta View","Interval_Wise Delta View","Overall_Delta View"], index=0)
 with c4:
     lang_choices = _languages_union(records, roster, center)
-    # default: select all to avoid empty views
-    langs_sel = st.multiselect("Languages", lang_choices, default=lang_choices)
+    langs_sel = st.multiselect("Languages", lang_choices, default=lang_choices)  # pick all by default
 
 st.divider()
 
@@ -993,7 +927,7 @@ with tab_dash:
 with tab_plot:
     st.subheader("📈 Plotter")
 
-    # ---- Time-series totals by day ----
+    # ---- Time-series totals by day (safe concat guards) ----
     def _series_from_pivot(p: pd.DataFrame, label: str) -> pd.DataFrame:
         if p.empty: return pd.DataFrame(columns=["Date","Value","Metric"])
         s = p.sum(axis=0)
@@ -1001,12 +935,11 @@ with tab_plot:
         out["Metric"] = label
         return out
 
-
-    ts_req = _series_from_pivot(req_shift, "Requested")
-    ts_ros = _series_from_pivot(ros_shift, "Rostered")
-    ts_del = _series_from_pivot(delt_shift, "Delta")
+    ts_req  = _series_from_pivot(req_shift, "Requested")
+    ts_ros  = _series_from_pivot(ros_shift, "Rostered")
+    ts_del  = _series_from_pivot(delt_shift, "Delta")
     _frames = [x for x in [ts_req, ts_ros, ts_del] if x is not None and not x.empty]
-    ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date", "Value", "Metric"])
+    ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date","Value","Metric"])
 
     if ts_all.empty:
         st.info("No data to plot in the selected filters.")
@@ -1016,41 +949,35 @@ with tab_plot:
             x="yearmonthdate(Date):O",
             y="Value:Q",
             color="Metric:N",
-            tooltip=["Metric", "Date", "Value"]
+            tooltip=["Metric","Date","Value"]
         ).properties(height=260, use_container_width=True)
         st.altair_chart(chart, use_container_width=True)
 
     st.markdown("---")
 
-    # ---- Shift-wise stacked bar (sum over selected dates) ----
-    if not req_shift.empty or not ros_shift.empty:
-        st.caption("Shift-wise counts (sum over selected dates)")
-        # Build melted frames
-        def _melt(p: pd.DataFrame, label: str) -> pd.DataFrame:
-            if p.empty: return pd.DataFrame(columns=["Shift","Value","Metric"])
-            m = p.reset_index().melt(id_vars="Shift", var_name="Date", value_name="Value")
-            m = m.groupby("Shift", as_index=False)["Value"].sum()
-            m["Metric"] = label
-            return m
+    # ---- Shift-wise bar (sum over selected dates) ----
+    def _melt_sum(p: pd.DataFrame, label: str) -> pd.DataFrame:
+        if p.empty: return pd.DataFrame(columns=["Shift","Value","Metric"])
+        m = p.reset_index().melt(id_vars="Shift", var_name="Date", value_name="Value")
+        m = m.groupby("Shift", as_index=False)["Value"].sum(); m["Metric"] = label
+        return m
 
+    m_req = _melt_sum(req_shift, "Requested")
+    m_ros = _melt_sum(ros_shift, "Rostered")
+    m_del = _melt_sum(delt_shift, "Delta")
+    _frames2 = [x for x in [m_req, m_ros, m_del] if x is not None and not x.empty]
+    m_all = pd.concat(_frames2, ignore_index=True) if _frames2 else pd.DataFrame(columns=["Shift","Value","Metric"])
 
-        m_req = _melt(req_shift, "Requested")
-        m_ros = _melt(ros_shift, "Rostered")
-        m_del = _melt(delt_shift, "Delta")
-        _frames2 = [x for x in [m_req, m_ros, m_del] if x is not None and not x.empty]
-        m_all = pd.concat(_frames2, ignore_index=True) if _frames2 else pd.DataFrame(
-            columns=["Shift", "Value", "Metric"])
-
-        if not m_all.empty:
-            chart2 = alt.Chart(m_all).mark_bar().encode(
-                x=alt.X("Shift:N", sort=None),
-                y=alt.Y("Value:Q", stack=None),
-                color="Metric:N",
-                tooltip=["Metric", "Shift", "Value"]
-            ).properties(height=300, use_container_width=True)
-            st.altair_chart(chart2, use_container_width=True)
-        else:
-            st.info("No shift-wise data to plot for the current filters.")
+    if not m_all.empty:
+        chart2 = alt.Chart(m_all).mark_bar().encode(
+            x=alt.X("Shift:N", sort=None),
+            y=alt.Y("Value:Q", stack=None),
+            color="Metric:N",
+            tooltip=["Metric","Shift","Value"]
+        ).properties(height=300, use_container_width=True)
+        st.altair_chart(chart2, use_container_width=True)
+    else:
+        st.info("No shift-wise data to plot for the current filters.")
 
     st.markdown("---")
 
