@@ -1047,6 +1047,54 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📤 Export Current View")
+    # Use the current top-of-page filters (center, langs_sel, start, end, view_type)
+    exp_name = f"{center}_{view_type.replace(' ', '_')}_{start:%Y%m%d}_{end:%Y%m%d}.xlsx"
+
+    # Build the file on click (avoids heavy work unless requested)
+    if st.button("Build Excel", type="primary", use_container_width=True):
+        try:
+            xlsx_bytes = export_excel(
+                view_type=view_type,
+                center=center,
+                languages_sel=langs_sel,
+                start=start,
+                end=end,
+                records=records,
+                roster=roster,
+            )
+            st.session_state["last_export_bytes"] = xlsx_bytes
+            st.success("Excel generated.")
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+
+    # Offer download if we have a built file
+    if "last_export_bytes" in st.session_state:
+        st.download_button(
+            "⬇️ Download Excel",
+            data=st.session_state["last_export_bytes"],
+            file_name=exp_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        # Optional: also push the same file to Google Drive
+        if st.checkbox("Also upload to Drive (same folder as DB)"):
+
+            if st.button("📤 Upload to Drive", use_container_width=True):
+                try:
+                    service = _get_drive_service()
+                    file_id = _drive_find_file_id(service, exp_name, DRIVE_FOLDER_ID or None)
+                    up_id = _drive_upload_bytes(
+                        service=service,
+                        name=exp_name,
+                        data=st.session_state["last_export_bytes"],
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        folder_id=DRIVE_FOLDER_ID or None,
+                        file_id=file_id,  # update if already exists
+                    )
+                    st.success(f"Uploaded to Drive (file id: {up_id}).")
+                except Exception as e:
+                    st.error(f"Drive upload failed: {e}")
 
 # ========== Top filter row (union of centers/languages) ==========
 c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.3, 1.7])
@@ -1063,7 +1111,11 @@ with c3:
     view_type = st.selectbox("View", ["Shift_Wise Delta View","Interval_Wise Delta View","Overall_Delta View"], index=0)
 with c4:
     lang_choices = _languages_union(records, roster, center)
-    langs_sel = st.multiselect("Languages", lang_choices, default=lang_choices)  # pick all by default
+    langs_sel = st.multiselect(
+        "Languages",
+        lang_choices,
+        default=(lang_choices if lang_choices else []),
+    )
 
 st.divider()
 
@@ -1132,104 +1184,345 @@ def render_dashboard(view_type: str,
             st.dataframe(add_total_row(delt_interval), use_container_width=True)
 
 
-def render_plotter(req_shift: pd.DataFrame, ros_shift: pd.DataFrame, delt_shift: pd.DataFrame):
-    st.subheader("📈 Plotter")
+# ==== Adapter so the new Plotter can read/write from your current data ====
+class DBAdapter:
+    def __init__(self, records_df, roster_df):
+        self.records = records_df
+        self.roster = roster_df
 
-    # ---- Time-series totals by day ----
-    def _series_from_pivot(p: pd.DataFrame, label: str) -> pd.DataFrame:
-        if p is None or p.empty:
-            return pd.DataFrame(columns=["Date", "Value", "Metric"])
-        s = p.sum(axis=0)
-        out = pd.DataFrame({"Date": s.index, "Value": s.values})
-        out["Metric"] = label
-        return out
+    def centers(self, include_overall=False):
+        cs = _centers_union(self.records, self.roster)
+        return [c for c in cs if c != "Overall"] if not include_overall else cs
 
-    ts_req = _series_from_pivot(req_shift, "Requested")
-    ts_ros = _series_from_pivot(ros_shift, "Rostered")
-    ts_del = _series_from_pivot(delt_shift, "Delta")
-    _frames = [x for x in (ts_req, ts_ros, ts_del) if x is not None and not x.empty]
-    ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date", "Value", "Metric"])
+    def languages(self, center):
+        return _languages_union(self.records, self.roster, center)
 
-    if ts_all.empty:
-        st.info("No data to plot in the selected filters.")
-    else:
-        ts_all["Date"] = pd.to_datetime(ts_all["Date"])
-        ts_all["Value"] = pd.to_numeric(ts_all["Value"], errors="coerce").fillna(0)
-        chart = (
-            alt.Chart(ts_all)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("yearmonthdate(Date):T", title="Date"),
-                y=alt.Y("Value:Q", title="Count"),
-                color=alt.Color("Metric:N"),
-                tooltip=["Metric", alt.Tooltip("Date:T"), alt.Tooltip("Value:Q")],
-            )
-            .properties(height=260, width="container")
-        )
-        st.altair_chart(chart, use_container_width=True)
+    def pivot_requested(self, center, langs, start, end):
+        # reuse your existing helper
+        return pivot_requested(self.records, center, langs, start, end)
+
+    def upsert_requested_cells(self, center, language, edits: dict):
+        """
+        edits: {(shift_label: str, date: datetime.date): value(float)}
+        """
+        if not edits:
+            return 0
+        rows = []
+        for (shift, d), v in edits.items():
+            rows.append({
+                "Center": center,
+                "Language": language,
+                "Shift": shift,
+                "Metric": "Requested",
+                "Date": d,
+                "Value": float(v),
+            })
+        df = pd.DataFrame(rows)
+
+        if DUCKDB_FILE_NAME:
+            local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+            if err or not local_db or not file_id:
+                st.error(f"DuckDB issue: {err or 'File not found.'}")
+                return 0
+            return duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, df)
+        else:
+            # Parquet fallback (merge-on-keys then append)
+            cur = load_parquet_from_drive(RECORDS_FILE)
+            if cur.empty:
+                save_parquet_to_drive(RECORDS_FILE, df)
+                return len(df)
+            keys = ["Center","Language","Shift","Date"]
+            left = cur.merge(df[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+            keep = left["_merge"] == "left_only"
+            base = cur[keep].copy()
+            new_all = pd.concat([base, df], ignore_index=True)
+            save_parquet_to_drive(RECORDS_FILE, new_all)
+            return len(df)
+# =========================
+# PLOTTER (Desktop-like) — FULL REPLACEMENT
+# =========================
+import re
+import pandas as pd
+from datetime import date
+
+# session state for plotter
+if "plot_grid" not in st.session_state:     st.session_state.plot_grid = None   # DataFrame with columns: ["Shift", ...dates...]
+if "plot_center" not in st.session_state:   st.session_state.plot_center = None
+if "plot_lang" not in st.session_state:     st.session_state.plot_lang = None
+if "plot_range" not in st.session_state:    st.session_state.plot_range = (None, None)
+if "plot_dirty" not in st.session_state:    st.session_state.plot_dirty = False
+
+_TIME_LIKE = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
+
+def _parse_ddmm_header_to_date(lbl: str, fallback_year: int) -> date | None:
+    s = str(lbl).strip()
+    for fmt in ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d"):
+        try:
+            return pd.to_datetime(s, format=fmt).date()
+        except Exception:
+            pass
+    # try with fallback year (when header is "05-Oct")
+    try:
+        return pd.to_datetime(f"{s}-{fallback_year}", format="%d-%b-%Y").date()
+    except Exception:
+        return None
+
+def _ensure_total_row(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    has_total = df["Shift"].astype(str).str.lower().eq("total").any()
+    if not has_total:
+        new = df.copy()
+        new.loc[len(new)] = ["Total"] + [0]*(df.shape[1]-1)
+        return new
+    return df
+
+def _recalc_total(df: pd.DataFrame) -> pd.DataFrame:
+    """Sum all non-'Total' rows per date column."""
+    if df is None or df.empty: return df
+    body = df[~df["Shift"].astype(str).str.lower().eq("total")]
+    sums = body.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=0)
+    out = df.copy()
+    mask_total = out["Shift"].astype(str).str.lower().eq("total")
+    out.loc[mask_total, out.columns[1:]] = sums.values
+    return out
+
+def _grid_to_requested_df(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame:
+    """
+    grid_df: ["Shift", "05-Oct", "06-Oct", ...] with a 'Total' summary row.
+    returns Shift×Date numeric DF (dates are real date objects), without 'Total'.
+    """
+    if grid_df is None or grid_df.empty: return pd.DataFrame()
+    cols = list(grid_df.columns)
+    if not cols or cols[0] != "Shift": return pd.DataFrame()
+
+    # map headers to real dates (skip those we cannot parse)
+    parsed = []
+    for h in cols[1:]:
+        d = _parse_ddmm_header_to_date(h, from_year)
+        parsed.append(d)
+    keep = [i+1 for i, d in enumerate(parsed) if d is not None]
+    out_dates = [d for d in parsed if d is not None]
+    if not keep: return pd.DataFrame()
+
+    body = grid_df[~grid_df["Shift"].astype(str).str.lower().eq("total")].copy()
+    body_rows = []
+    idx_labels = []
+    for _, r in body.iterrows():
+        lbl = str(r["Shift"]).strip()
+        if not lbl or not _TIME_LIKE.fullmatch(lbl):
+            # only time-like shifts saved to Requested (skip codes)
+            continue
+        vals = []
+        for j in keep:
+            try:
+                v = float(r.iloc[j])
+            except Exception:
+                v = 0.0
+            vals.append(int(v) if float(v).is_integer() else float(v))
+        body_rows.append(vals); idx_labels.append(lbl)
+
+    if not body_rows: return pd.DataFrame()
+    df = pd.DataFrame(body_rows, index=idx_labels, columns=out_dates)
+    return df
+
+def _plotter_load_grid(db, centre: str, lang: str, d_start: date, d_end: date) -> pd.DataFrame:
+    """
+    Build the editable grid from DB Requested (Shift×Date + Total row).
+    Date headers are DD-MMM (no year), sorted chronologically.
+    """
+    req_df = db.pivot_requested(centre, [lang], d_start, d_end)
+    req_df = dedup_requested_split_pairs(req_df)
+    # Keep only dates within range
+    keep_cols = []
+    for c in req_df.columns:
+        cd = c.date() if hasattr(c, "date") else c
+        if d_start <= cd <= d_end:
+            keep_cols.append(c)
+    keep_cols = sorted(keep_cols)
+    req_df = req_df.reindex(columns=keep_cols, fill_value=0.0)
+
+    # Build editable grid
+    headers = ["Shift"] + [pd.to_datetime(c).strftime("%d-%b") for c in keep_cols]
+    grid = []
+    for shift_label in req_df.index:
+        row = [str(shift_label)]
+        for c in keep_cols:
+            v = req_df.at[shift_label, c]
+            try:
+                vf = float(v); row.append(int(vf) if vf.is_integer() else round(vf, 2))
+            except Exception:
+                row.append(0)
+        grid.append(row)
+
+    df = pd.DataFrame(grid, columns=headers)
+    df = _ensure_total_row(df)
+    df = _recalc_total(df)
+    return df
+
+def _plotter_interval_from_grid(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame:
+    """Transform current grid into Interval×Date table (auto), including Total row."""
+    req = _grid_to_requested_df(grid_df, from_year)
+    if req.empty:
+        return pd.DataFrame(columns=["Interval"])
+    req.index.name = "Shift"
+    inter = transform_to_interval_view(req)  # uses your helper
+    inter = inter.reindex(index=range(24), fill_value=0.0)
+    inter = add_total_row(inter)
+    inter.index.name = "Interval"
+    return inter
+
+def render_plotter(db):
+    """
+    db: your DB adapter with:
+       - centers(include_overall=False) -> list[str]
+       - languages(center) -> list[str]
+       - pivot_requested(center, [lang], start, end) -> DF
+       - upsert_requested_cells(center, language, edits) -> None
+    """
+    st.subheader("🧮 Plotter (desktop workflow)")
+
+    # ---- Controls row ----
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1, 1, 1.6])
+
+    with c1:
+        centers = db.centers(include_overall=False) or []
+        centre = st.selectbox("Center", centers, index=0 if centers else None, key="plot_center_sel")
+    with c2:
+        langs = db.languages(centre) if centre else []
+        lang = st.selectbox("Language", langs, index=0 if langs else None, key="plot_lang_sel")
+
+    # derive default dates from DB span for the chosen center if available
+    with c3:
+        d_from = st.date_input("From", value=st.session_state.get("plot_from") or date.today(), key="plot_from")
+    with c4:
+        d_to = st.date_input("To", value=st.session_state.get("plot_to") or date.today(), key="plot_to")
+
+    def _reload_grid():
+        if not centre or not lang: return
+        grid = _plotter_load_grid(db, centre, lang, d_from, d_to)
+        st.session_state.plot_grid = grid
+        st.session_state.plot_center = centre
+        st.session_state.plot_lang = lang
+        st.session_state.plot_range = (d_from, d_to)
+        st.session_state.plot_dirty = False
+
+    # First load or when filters change
+    if (st.session_state.plot_grid is None or
+        st.session_state.plot_center != centre or
+        st.session_state.plot_lang != lang or
+        st.session_state.plot_range != (d_from, d_to)):
+        _reload_grid()
+
+    with c5:
+        # toolbar buttons
+        b1, b2, b3, b4 = st.columns([1,1,1,1.2])
+        if b1.button("Add Date"):
+            # add any missing dates in [From..To]
+            if st.session_state.plot_grid is not None and not st.session_state.plot_grid.empty:
+                headers = list(st.session_state.plot_grid.columns)
+                base_year = d_from.year
+                existing = set()
+                for h in headers[1:]:
+                    dd = _parse_ddmm_header_to_date(h, base_year)
+                    if dd: existing.add(dd)
+                wanted = pd.date_range(d_from, d_to, freq="D").date
+                to_add = [d for d in wanted if d not in existing]
+                if to_add:
+                    new_headers = headers + [d.strftime("%d-%b") for d in to_add]
+                    g = st.session_state.plot_grid.copy()
+                    for nh in new_headers:
+                        if nh not in g.columns:
+                            g[nh] = 0
+                    # order date columns chronologically
+                    head = ["Shift"]
+                    pairs = []
+                    for h in g.columns[1:]:
+                        dd = _parse_ddmm_header_to_date(h, base_year)
+                        if dd: pairs.append((h, dd))
+                    pairs.sort(key=lambda x: x[1])
+                    head += [h for h,_ in pairs]
+                    g = g[head]
+                    g = _ensure_total_row(g)
+                    g = _recalc_total(g)
+                    st.session_state.plot_grid = g
+                    st.session_state.plot_dirty = True
+                else:
+                    st.info("No new dates to add in the selected range.")
+            else:
+                _reload_grid()
+
+        # fake placeholders for parity with desktop
+        b2.button("Manage Shifts", help="(Open your shifts screen in web app)")
+        b3.button("Manage Languages", help="(Open your languages screen in web app)")
+
+        # SAVE button
+        if b4.button("Save", type="primary", help="Write non-zero Requested cells to DB"):
+            grid = st.session_state.plot_grid
+            if grid is None or grid.empty or grid.shape[1] < 2:
+                st.warning("Nothing to save.")
+            else:
+                req_df = _grid_to_requested_df(grid, d_from.year)
+                edits = {}
+                for sh, row in req_df.iterrows():
+                    for d, v in row.items():
+                        if float(v) != 0.0:
+                            edits[(sh, d)] = float(v)
+                if edits:
+                    db.upsert_requested_cells(centre, lang, edits)
+                    st.success(f"Saved {len(edits)} cells.")
+                    st.session_state.plot_dirty = False
+                else:
+                    st.info("No non-zero changes to save.")
 
     st.markdown("---")
 
-    # ---- Shift-wise bar ----
-    def _melt_sum(p: pd.DataFrame, label: str) -> pd.DataFrame:
-        if p is None or p.empty:
-            return pd.DataFrame(columns=["Shift", "Value", "Metric"])
-        df = p.copy().reset_index()
-        if "Shift" not in df.columns:
-            df = df.rename(columns={df.columns[0]: "Shift"})
-        m = df.melt(id_vars="Shift", var_name="Date", value_name="Value")
-        m = m.groupby("Shift", as_index=False)["Value"].sum()
-        m["Metric"] = label
-        m["Value"] = pd.to_numeric(m["Value"], errors="coerce").fillna(0)
-        return m
+    # ---- Shift-wise (editable) ----
+    st.caption("Shift-wise Requested (editable)")
+    if st.session_state.plot_grid is None:
+        st.info("Select Center, Language and date range to load.")
+        return
 
-    m_req = _melt_sum(req_shift, "Requested")
-    m_ros = _melt_sum(ros_shift, "Rostered")
-    m_del = _melt_sum(delt_shift, "Delta")
-    _frames2 = [x for x in (m_req, m_ros, m_del) if x is not None and not x.empty]
-    m_all = pd.concat(_frames2, ignore_index=True) if _frames2 else pd.DataFrame(columns=["Shift", "Value", "Metric"])
+    # Make first column read-only via column_config + disable editing of 'Total' row via on_change fix-up
+    cfg = {"Shift": st.column_config.TextColumn("Shift", disabled=True)}
+    edited = st.data_editor(
+        st.session_state.plot_grid,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config=cfg,
+        key="plot_editor",
+    )
 
-    if m_all.empty:
-        st.info("No shift-wise data to plot for the current filters.")
+    # Keep Total row locked & recompute
+    if not edited.empty:
+        # enforce Total row label
+        if "Shift" in edited.columns:
+            edited.loc[edited["Shift"].astype(str).str.lower() == "total", "Shift"] = "Total"
+        # zero out edits on Total (data columns)
+        mask_total = edited["Shift"].astype(str).str.lower() == "total"
+        if mask_total.any():
+            cols = [c for c in edited.columns if c != "Shift"]
+            edited.loc[mask_total, cols] = 0
+        edited = _ensure_total_row(edited)
+        edited = _recalc_total(edited)
+
+    st.session_state.plot_grid = edited
+    st.session_state.plot_dirty = True
+
+    # ---- Interval-wise (auto) ----
+    inter = _plotter_interval_from_grid(edited, d_from.year)
+    if inter.empty:
+        st.info("No interval view for current grid.")
     else:
-        chart2 = (
-            alt.Chart(m_all)
-            .mark_bar()
-            .encode(
-                x=alt.X("Shift:N", sort=None),
-                y=alt.Y("Value:Q", stack=None),
-                color="Metric:N",
-                tooltip=["Metric", "Shift", "Value"],
-            )
-            .properties(height=300, width="container")
-        )
-        st.altair_chart(chart2, use_container_width=True)
+        st.caption("Interval-wise Requested (auto)")
+        st.dataframe(inter, use_container_width=True)
 
-    st.markdown("---")
+    st.markdown(
+        f"<div style='text-align:right;color:#888'>"
+        f"{'Unsaved changes' if st.session_state.plot_dirty else 'Up to date'}"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
-    # ---- Interval heatmap for Delta ----
-    if not delt_shift.empty:
-        st.caption("Interval heatmap (Delta) – hours vs dates")
-        delt_interval = transform_to_interval_view(delt_shift)
-        if not delt_interval.empty:
-            heat = delt_interval.copy()
-            heat.index.name = "Hour"
-            heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
-            heat["Date"] = pd.to_datetime(heat["Date"])
-            heat["Hours"] = pd.to_numeric(heat["Hours"], errors="coerce").fillna(0)
-
-            hchart = (
-                alt.Chart(heat)
-                .mark_rect()
-                .encode(
-                    x=alt.X("yearmonthdate(Date):T", title="Date"),
-                    y=alt.Y("Hour:O", title="Hour of day"),
-                    color=alt.Color("Hours:Q", title="Delta hours"),
-                    tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")],
-                )
-                .properties(height=360, width="container")
-            )
-            st.altair_chart(hchart, use_container_width=True)
 
 
 def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
@@ -1253,9 +1546,13 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
     with r3:
         codes = roster_nonshift_codes(roster, center, start, end, lob, rlang)
         nonshift_sel = st.selectbox("Non-Shift", ["(All)"] + codes, disabled=disabled)
+
     with r4:
         shifts_list = roster_distinct_shifts(roster, center, start, end, lob, rlang)
-        shift_sel = st.selectbox("Shift", ["(All)"] + shifts_list, disabled=disabled)
+        # If a Non-Shift is chosen, visually disable Shift (your filter logic already prioritizes Non-Shift)
+        shift_disabled = disabled or (nonshift_sel not in ("", "(All)"))
+        shift_sel = st.selectbox("Shift", ["(All)"] + shifts_list, disabled=shift_disabled)
+
     with r5:
         ids_text = st.text_input("Genesys IDs (comma/space)", disabled=disabled)
         ids = [x.strip() for x in re.findall(r"[A-Za-z0-9_]+", ids_text)] if ids_text else None
@@ -1317,6 +1614,8 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
 
 
 # ------- Persistent tab switcher (no auto-jump on rerun) -------
+db = DBAdapter(records, roster)
+
 tab_choice = st.radio(
     "View",
     ["Dashboard", "Plotter", "Roster"],
@@ -1331,6 +1630,6 @@ if tab_choice == "Dashboard":
         req_shift_total, ros_shift_total, delt_shift_total
     )
 elif tab_choice == "Plotter":
-    render_plotter(req_shift, ros_shift, delt_shift)
+    render_plotter(db)
 else:
     render_roster(roster, center, start, end)
