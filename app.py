@@ -231,21 +231,78 @@ def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str
             diags["note"] += f" | records read error: {e}"
 
     # roster_long
+    # roster_long  (schema-tolerant loader)
     try:
-        df_roster = con.execute("""
-            SELECT AgentID, EmpID, AgentName, TLName, Status, WorkMode,
-                   Center, Location, Language, SecondaryLanguage, LOB, FTPT,
-                   BaseShift, Date, Shift
-            FROM roster_long
-        """).df()
+        # Discover real schema
+        info = con.execute("PRAGMA table_info('roster_long')").df()
+        if info.empty:
+            raise Exception("table 'roster_long' not found or has no columns")
+
+        # case-insensitive name lookup
+        name_map = {str(n).strip().lower(): str(n).strip() for n in info["name"].astype(str)}
+
+        def has(col):
+            return col.lower() in name_map
+
+        def col(col):
+            return name_map.get(col.lower(), col)
+
+        select_bits = []
+
+        def add_varchar(target_name, source_name=None):
+            """
+            Add a VARCHAR column either from existing source, or NULL if missing.
+            """
+            if source_name and has(source_name):
+                select_bits.append(f"{col(source_name)} AS {target_name}")
+            elif has(target_name):
+                select_bits.append(f"{col(target_name)}")
+            else:
+                select_bits.append(f"CAST(NULL AS VARCHAR) AS {target_name}")
+
+        # static/meta columns (fill if missing)
+        add_varchar("AgentID")
+        add_varchar("EmpID")
+        add_varchar("AgentName")
+        add_varchar("TLName")
+        add_varchar("Status")
+        # WorkMode: sometimes stored as Reason in legacy dumps — pick whichever exists
+        if has("WorkMode"):
+            add_varchar("WorkMode", "WorkMode")
+        elif has("Reason"):
+            add_varchar("WorkMode", "Reason")
+        else:
+            add_varchar("WorkMode")
+
+        add_varchar("Center")
+        add_varchar("Location")
+        add_varchar("Language")
+        add_varchar("SecondaryLanguage")
+        add_varchar("LOB")
+        add_varchar("FTPT")
+        add_varchar("BaseShift")
+
+        # Date
+        if has("Date"):
+            select_bits.append(f"{col('Date')}")
+        else:
+            select_bits.append("CAST(NULL AS DATE) AS Date")
+
+        # Shift (fallback: Reason -> Shift if Shift missing)
+        if has("Shift"):
+            select_bits.append(f"{col('Shift')}")
+        elif has("Reason"):
+            select_bits.append(f"{col('Reason')} AS Shift")
+        else:
+            select_bits.append("CAST(NULL AS VARCHAR) AS Shift")
+
+        sql = "SELECT " + ", ".join(select_bits) + " FROM roster_long"
+        df_roster = con.execute(sql).df()
+
     except Exception as e:
         df_roster = pd.DataFrame()
         diags["note"] += f" | roster_long read error: {e}"
 
-    con.close()
-    diags["records_rows"] = str(0 if df_records is None or df_records.empty else len(df_records))
-    diags["roster_rows"]  = str(0 if df_roster is None or df_roster.empty else len(df_roster))
-    return df_records, df_roster, diags
 
 # ============ DuckDB write helpers ============
 def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
