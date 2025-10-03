@@ -743,6 +743,92 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
                 max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
     return output.getvalue()
+# === Requested editor helpers (desktop-style) ===
+def _validate_shift_label_for_edit(s: str) -> Optional[str]:
+    if pd.isna(s) or str(s).strip() == "":
+        return None
+    return _normalize_shift_label(str(s).strip())
+
+def _pivot_requested_one_lang(records: pd.DataFrame, center: str, language: str, start: date, end: date) -> pd.DataFrame:
+    if records.empty:
+        return pd.DataFrame()
+    df = records[(records["Date"].between(start, end)) & (records["Language"] == language)].copy()
+    if center and center != "Overall":
+        df = df[df["Center"] == center]
+    if df.empty:
+        return pd.DataFrame()
+    p = df.groupby(["Shift","Date"], as_index=False)["Value"].sum()
+    p = p.pivot(index="Shift", columns="Date", values="Value").fillna(0.0)
+    p = p.reindex(sorted(p.columns), axis=1)
+    p.index.name = "Shift"
+    return p
+
+def _save_requested_edits(center: str, language: str, edited_df: pd.DataFrame, start: date, end: date) -> Tuple[int, str]:
+    """
+    Takes an edited 'Requested' grid (index=Shift, columns=Dates) and writes back to DuckDB/Parquet.
+    Returns (rows_upserted, message).
+    """
+    if edited_df is None or edited_df.empty:
+        return 0, "Nothing to save."
+
+    # Ensure date columns are real dates
+    new_df = edited_df.copy()
+    try:
+        new_df.columns = [pd.to_datetime(c).date() for c in new_df.columns]
+    except Exception:
+        new_df = new_df[[c for c in new_df.columns if isinstance(c, (pd.Timestamp, date))]]
+
+    if new_df.empty:
+        return 0, "No valid date columns after validation."
+
+    # Normalize / validate shift labels
+    new_df = new_df.reset_index().rename(columns={new_df.index.name or "index": "Shift"})
+    new_df["ShiftNorm"] = new_df["Shift"].apply(_validate_shift_label_for_edit)
+    new_df = new_df[~new_df["ShiftNorm"].isna()].copy()
+    if new_df.empty:
+        return 0, "All rows had invalid/empty shift labels."
+    new_df = new_df.drop(columns=["Shift"]).rename(columns={"ShiftNorm": "Shift"}).set_index("Shift")
+
+    # melt to long
+    out_long = new_df.reset_index().melt(id_vars="Shift", var_name="Date", value_name="Value")
+    out_long = out_long.dropna(subset=["Value"])
+    if out_long.empty:
+        return 0, "No numeric values to save."
+
+    out_long["Value"] = pd.to_numeric(out_long["Value"], errors="coerce")
+    out_long = out_long.dropna(subset=["Value"])
+    if out_long.empty:
+        return 0, "No numeric values to save."
+
+    out_long["Center"] = center
+    out_long["Language"] = language
+    out_long["Metric"] = "Requested"
+    out_long = out_long[["Center","Language","Shift","Metric","Date","Value"]].copy()
+
+    # Write back
+    if DUCKDB_FILE_NAME:
+        local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+        if err or not local_db or not file_id:
+            return 0, f"DuckDB issue: {err or 'File not found.'}"
+        try:
+            n = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, out_long)
+            return n, f"Saved {n} Requested cells for {language}."
+        except Exception as e:
+            return 0, f"DuckDB upsert failed: {e}"
+    else:
+        cur = load_parquet_from_drive(RECORDS_FILE)
+        if cur.empty:
+            save_parquet_to_drive(RECORDS_FILE, out_long)
+            load_parquet_from_drive.clear()
+            return len(out_long), f"Saved {len(out_long)} Requested cells for {language}."
+        keys = ["Center","Language","Shift","Date"]
+        left = cur.merge(out_long[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+        keep = left["_merge"] == "left_only"
+        base = cur[keep].copy()
+        new_all = pd.concat([base, out_long], ignore_index=True)
+        save_parquet_to_drive(RECORDS_FILE, new_all)
+        load_parquet_from_drive.clear()
+        return len(out_long), f"Saved {len(out_long)} Requested cells for {language}."
 
 # =========================
 # UI
@@ -899,7 +985,8 @@ with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
 # =========================
 # Tabs: Dashboard | Plotter | Roster
 # =========================
-tab_dash, tab_plot, tab_roster = st.tabs(["Dashboard", "Plotter", "Roster"])
+tab_dash, tab_plot, tab_roster, tab_req = st.tabs(["Dashboard", "Plotter", "Roster", "Requested"])
+
 
 with tab_dash:
     sub1, sub2, sub3 = st.columns(3)
@@ -1087,3 +1174,66 @@ with tab_roster:
             nonempty_cols = [c for c in date_cols if wide[c].astype(str).str.strip().ne("").any()]
             wide = pd.concat([wide[static_cols], wide[nonempty_cols]], axis=1)
     st.dataframe(wide, use_container_width=True)
+    with tab_req:
+        st.subheader("📝 Requested (Desktop-style Editor)")
+        if center in (None, "", "Overall"):
+            st.info("Select a specific **Center** to edit Requested like the desktop app.")
+        elif not langs_sel:
+            st.info("Pick at least one **Language** to edit.")
+        else:
+            # Tabs per language (mirrors desktop edit per language)
+            lang_tabs = st.tabs(langs_sel)
+            save_results = []
+            for i, language in enumerate(langs_sel):
+                with lang_tabs[i]:
+                    st.caption(f"Center: **{center}**  •  Language: **{language}**  •  Dates: {start} → {end}")
+
+                    # existing data for this language
+                    p = _pivot_requested_one_lang(records, center, language, start, end)
+
+                    # if no rows yet, build an empty frame with date columns
+                    if p.empty:
+                        all_days = pd.date_range(start=start, end=end, freq="D").date
+                        p = pd.DataFrame(columns=list(all_days))
+                        p.index.name = "Shift"
+
+                    # editor wants a materialized Shift column
+                    edit_df = p.copy()
+                    edit_df = edit_df.reset_index().rename(columns={"index": "Shift"})
+
+                    st.caption(
+                        "Tip: Add a row for a new shift (e.g., `0900-1800` or `0900-1300/1400-1800`). Non-time codes like `WO` / `CL` are allowed.")
+                    edited = st.data_editor(
+                        edit_df,
+                        key=f"req_edit_{center}_{language}_{start}_{end}",
+                        num_rows="dynamic",
+                        use_container_width=True
+                    )
+
+                    # Save button for this language
+                    colA, colB = st.columns([1, 2])
+                    with colA:
+                        if st.button(f"💾 Save {language}", key=f"save_{center}_{language}_{start}_{end}"):
+                            # Turn back into index=Shift (validated inside saver)
+                            try:
+                                edited2 = edited.set_index("Shift")
+                            except Exception:
+                                edited2 = pd.DataFrame()
+
+                            n, msg = _save_requested_edits(center, language, edited2, start, end)
+                            save_results.append((language, n, msg))
+                            # After saving, refresh cache + rerun so top-level pivots, charts, etc. update
+                            load_from_duckdb.clear()
+                            load_parquet_from_drive.clear()
+                            st.experimental_rerun()
+                    with colB:
+                        st.caption("Saving overwrites Requested for matching (Center, Language, Shift, Date).")
+
+            # (optional) show any inline messages (usually reruns immediately)
+            for language, n, msg in save_results:
+                if n > 0:
+                    st.success(msg)
+                else:
+                    st.info(msg)
+
+
