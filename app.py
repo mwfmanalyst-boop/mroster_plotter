@@ -31,8 +31,11 @@ def _get_drive_service():
         scopes = ['https://www.googleapis.com/auth/drive']
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
         return build('drive', 'v3', credentials=creds, cache_discovery=False)
-    except Exception as e:
+    except KeyError:
         st.error("Google Drive auth failed. Please add service account JSON to st.secrets['gcp_service_account'].")
+        raise
+    except Exception as e:
+        st.error(f"Google Drive auth failed: {e}")
         raise
 
 def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
@@ -76,10 +79,10 @@ def load_parquet_from_drive(name: str) -> pd.DataFrame:
     if not file_id:
         return pd.DataFrame()
     raw = _drive_download_bytes(service, file_id)
+    # Try parquet, fallback csv
     try:
         return pd.read_parquet(io.BytesIO(raw))
     except Exception:
-        # Allow CSV fallback if needed
         try:
             return pd.read_csv(io.BytesIO(raw))
         except Exception:
@@ -91,7 +94,7 @@ def save_parquet_to_drive(name: str, df: pd.DataFrame):
     file_id = _drive_find_file_id(service, name, folder_id)
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
-    _drive_upload_bytes(service, name, buf.getvalue(), "application/octet-stream", folder_id, file_id)
+    _drive_upload_bytes(service, name, buf.getvalue(), "application/vnd.apache.parquet", folder_id, file_id)
     # Bust cache
     load_parquet_from_drive.clear()
 
