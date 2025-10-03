@@ -1,6 +1,7 @@
 import io
 import re
 import json
+import tempfile
 from datetime import date, timedelta, datetime
 from typing import Optional, Tuple, List, Dict
 
@@ -12,6 +13,9 @@ import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+
+# DuckDB
+import duckdb
 
 # =========================
 # Page + Global Config
@@ -97,6 +101,178 @@ def save_parquet_to_drive(name: str, df: pd.DataFrame):
     _drive_upload_bytes(service, name, buf.getvalue(), "application/vnd.apache.parquet", folder_id, file_id)
     # Bust cache
     load_parquet_from_drive.clear()
+
+# -----------------------------
+# DuckDB Load/Save (from/to Drive)
+# -----------------------------
+DUCKDB_FILE_NAME = st.secrets.get("DUCKDB_FILE_NAME", None)  # e.g., "cmb_delta.duckdb"
+
+def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Download DuckDB file from Drive to a temp path (read-write). Returns (local_path, file_id)."""
+    service = _get_drive_service()
+    folder_id = st.secrets.get("DRIVE_FOLDER_ID", None)
+    file_id = _drive_find_file_id(service, name, folder_id)
+    if not file_id:
+        return None, None
+    raw = _drive_download_bytes(service, file_id)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
+    tmp.write(raw); tmp.flush(); tmp.close()
+    return tmp.name, file_id
+
+def _upload_duckdb_back(local_path: str, file_id: str, name: str):
+    """Upload the modified DuckDB file back to Drive (overwrite by id)."""
+    service = _get_drive_service()
+    with open(local_path, "rb") as f:
+        data = f.read()
+    _drive_upload_bytes(service, name, data, "application/octet-stream", st.secrets.get("DRIVE_FOLDER_ID"), file_id)
+
+@st.cache_data(ttl=300)
+def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Download db_name from Drive and read expected tables into DataFrames (read-only).
+    Expected tables:
+      - records(Center, Language, Shift, Date, Value [, Metric])
+      - roster_long(AgentID, Center, Language, LOB, Shift, Date, ...)
+    """
+    # Use read-only connection by making a copy to tmp
+    local_path, _ = _download_duckdb_rw(db_name)
+    if not local_path:
+        return pd.DataFrame(), pd.DataFrame()
+
+    con = duckdb.connect(local_path, read_only=True)
+    # records
+    try:
+        df_records = con.execute("""
+            SELECT Center, Language, Shift, Metric, Date, Value
+            FROM records
+        """).df()
+    except Exception:
+        try:
+            df_records = con.execute("""
+                SELECT Center, Language, Shift, Date, Value
+                FROM records
+            """).df()
+            df_records["Metric"] = "Requested"
+            df_records = df_records[["Center","Language","Shift","Metric","Date","Value"]]
+        except Exception:
+            df_records = pd.DataFrame()
+
+    # roster_long
+    try:
+        df_roster = con.execute("""
+            SELECT AgentID, EmpID, AgentName, TLName, Status, WorkMode,
+                   Center, Location, Language, SecondaryLanguage, LOB, FTPT,
+                   BaseShift, Date, Shift
+            FROM roster_long
+        """).df()
+    except Exception:
+        df_roster = pd.DataFrame()
+
+    con.close()
+    return df_records, df_roster
+
+# ============ DuckDB write helpers ============
+def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            Center VARCHAR,
+            Language VARCHAR,
+            Shift VARCHAR,
+            Metric VARCHAR,
+            Date DATE,
+            Value DOUBLE
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS roster_long (
+            AgentID VARCHAR,
+            EmpID VARCHAR,
+            AgentName VARCHAR,
+            TLName VARCHAR,
+            Status VARCHAR,
+            WorkMode VARCHAR,
+            Center VARCHAR,
+            Location VARCHAR,
+            Language VARCHAR,
+            SecondaryLanguage VARCHAR,
+            LOB VARCHAR,
+            FTPT VARCHAR,
+            BaseShift VARCHAR,
+            Date DATE,
+            Shift VARCHAR
+        );
+    """)
+
+def duckdb_upsert_records(local_db_path: str, file_id: str, name_in_drive: str, new_rows: pd.DataFrame) -> int:
+    """
+    UPSERT rows into records on (Center, Language, Shift, Date).
+    Reuploads DB to Drive after commit. Returns affected row count from new_rows.
+    """
+    if new_rows.empty:
+        return 0
+
+    # Ensure required columns and types
+    need_cols = ["Center","Language","Shift","Metric","Date","Value"]
+    for c in need_cols:
+        if c not in new_rows.columns:
+            raise RuntimeError(f"Missing column in new Requested rows: {c}")
+    new_rows = new_rows.copy()
+    new_rows["Metric"] = new_rows["Metric"].fillna("Requested")
+    new_rows["Date"] = pd.to_datetime(new_rows["Date"]).dt.date
+
+    con = duckdb.connect(local_db_path, read_only=False)
+    _ensure_duckdb_schema(con)
+    con.register("new_records_df", new_rows)
+
+    # Use MERGE for upsert
+    con.execute("""
+        MERGE INTO records AS t
+        USING new_records_df AS s
+        ON t.Center = s.Center
+           AND t.Language = s.Language
+           AND t.Shift = s.Shift
+           AND t.Date = s.Date
+        WHEN MATCHED THEN UPDATE SET
+            Metric = s.Metric,
+            Value  = s.Value
+        WHEN NOT MATCHED THEN INSERT (Center, Language, Shift, Metric, Date, Value)
+        VALUES (s.Center, s.Language, s.Shift, s.Metric, s.Date, s.Value);
+    """)
+    con.close()
+
+    # Upload back
+    _upload_duckdb_back(local_db_path, file_id, name_in_drive)
+    # Bust the cache for readers
+    load_from_duckdb.clear()
+    return len(new_rows)
+
+def duckdb_replace_roster(local_db_path: str, file_id: str, name_in_drive: str, roster_df: pd.DataFrame) -> int:
+    """
+    REPLACE the roster_long table entirely with roster_df.
+    Reuploads DB to Drive after commit. Returns inserted row count.
+    """
+    if roster_df.empty:
+        return 0
+
+    # Normalize dtypes
+    roster_df = roster_df.copy()
+    roster_df["Date"] = pd.to_datetime(roster_df["Date"]).dt.date
+
+    con = duckdb.connect(local_db_path, read_only=False)
+    _ensure_duckdb_schema(con)
+    con.register("new_roster_df", roster_df)
+
+    con.execute("DROP TABLE IF EXISTS roster_long;")
+    con.execute("""
+        CREATE TABLE roster_long AS
+        SELECT * FROM new_roster_df;
+    """)
+    inserted = con.execute("SELECT COUNT(*) FROM roster_long;").fetchone()[0]
+    con.close()
+
+    _upload_duckdb_back(local_db_path, file_id, name_in_drive)
+    load_from_duckdb.clear()
+    return int(inserted)
 
 # =========================
 # Parsing helpers (ported)
@@ -236,130 +412,34 @@ def read_roster_sheet(file_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
 # =========================
-# Data model in Drive
+# Data model selection (DuckDB preferred)
 # =========================
 RECORDS_FILE = "records.parquet"          # columns: Center, Language, Shift, Metric, Date, Value
 ROSTER_FILE  = "roster_long.parquet"      # normalized agent/day roster
 
 def load_store() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    records = load_parquet_from_drive(RECORDS_FILE)
-    roster  = load_parquet_from_drive(ROSTER_FILE)
-    # dtype fixes
+    """
+    Prefer loading from DUCKDB_FILE_NAME if provided; else load Parquet files.
+    """
+    if DUCKDB_FILE_NAME:
+        records, roster = load_from_duckdb(DUCKDB_FILE_NAME)
+    else:
+        records = load_parquet_from_drive(RECORDS_FILE)
+        roster  = load_parquet_from_drive(ROSTER_FILE)
+
+    # dtype + schema fixes
     if not records.empty:
         records["Date"] = pd.to_datetime(records["Date"]).dt.date
-        # ensure only Requested
-        records = records[records["Metric"] == "Requested"].copy()
+        if "Metric" in records.columns:
+            records = records[records["Metric"] == "Requested"].copy()
+        else:
+            records["Metric"] = "Requested"
     if not roster.empty:
         roster["Date"] = pd.to_datetime(roster["Date"]).dt.date
         for c in ["AgentID","Language","Center","LOB","Shift"]:
             if c in roster.columns:
                 roster[c] = roster[c].astype(str).str.strip()
     return records, roster
-
-def upsert_records(records_df: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
-    if new_rows.empty: return records_df
-    # delete overlapping rows for the same (Center, Language, Shift, Date)
-    keys = ["Center","Language","Shift","Date"]
-    if records_df.empty:
-        base = pd.DataFrame(columns=new_rows.columns)
-    else:
-        left = records_df.merge(new_rows[keys].drop_duplicates(), on=keys, how="left", indicator=True)
-        keep = left["_merge"] == "left_only"
-        base = records_df[keep].copy()
-    out = pd.concat([base, new_rows], ignore_index=True)
-    return out
-
-def replace_roster(_old: pd.DataFrame, raw_roster: pd.DataFrame) -> pd.DataFrame:
-    d = raw_roster.copy()
-    name_map = {str(c).strip().lower(): c for c in d.columns}
-    def find_col(*keys):
-        keys = [str(k).lower() for k in keys]
-        for k in keys:
-            if k in name_map: return name_map[k]
-        for k in keys:
-            for low, real in name_map.items():
-                if k in low: return real
-        return None
-    col_agent_id = find_col("genesys id", "genesysid", "agent id", "agent_id", "agent genesys id")
-    col_emp_id = find_col("emp id", "employee id")
-    col_agent_name = find_col("agent name", "name")
-    col_tl = find_col("tl name", "team lead", "tl")
-    col_lob = find_col("lob", "process", "queue")
-    col_center = find_col("center")
-    col_lang = find_col("primary language", "language")
-    col_workmode = find_col("wfo/wfh", "wfo", "workmode")
-    col_base_shift = find_col("shift")
-    col_status = find_col("status")
-    col_loc = find_col("location")
-    col_lang2 = find_col("secondary language")
-    col_ftpt = find_col("ft/pt", "ftpt", "ft-pt")
-    essentials = {"AgentID": col_agent_id, "Center": col_center, "Primary Language": col_lang}
-    missing = [k for k,v in essentials.items() if v is None]
-    if missing:
-        raise RuntimeError(f"Roster import: missing columns -> {', '.join(missing)}")
-    date_cols = []
-    for c in d.columns:
-        if c in {col_agent_id, col_emp_id, col_agent_name, col_tl, col_lob, col_center,
-                 col_lang, col_workmode, col_base_shift, col_status, col_loc, col_lang2, col_ftpt}:
-            continue
-        try:
-            pd.to_datetime(c, errors="raise"); date_cols.append(c)
-        except Exception:
-            pass
-    if not date_cols:
-        raise RuntimeError("Roster import: no day columns detected in headers")
-    val_col = "__daily__"
-    long_df = d.melt(
-        id_vars=[c for c in [col_agent_id, col_emp_id, col_agent_name, col_tl, col_status,
-                             col_workmode, col_center, col_loc, col_lang, col_lang2,
-                             col_lob, col_ftpt, col_base_shift] if c is not None],
-        value_vars=date_cols, var_name="Date", value_name=val_col
-    )
-    long_df["Date"] = pd.to_datetime(long_df["Date"]).dt.date
-    def _norm_daily(v):
-        if pd.isna(v): return None
-        s = str(v).strip()
-        if not s: return None
-        t = s.upper().replace("HRS","" ).replace("HR","" ).replace(".",":")
-        if re.fullmatch(r"[A-Z/+\-]+", t) and not re.search(r"\d", t):
-            return t
-        parts = [p.strip() for p in re.split(r"\s*/\s*", t) if p.strip()]
-        norm_parts = []
-        for p in parts:
-            m = re.fullmatch(r"(\d{1,2})[:]?(\d{2})\s*-\s*(\d{1,2})[:]?(\d{2})", p)
-            if not m: return None
-            sh, sm, eh, em = map(int, m.groups())
-            if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
-                return None
-            norm_parts.append(f"{sh:02d}{sm:02d}-{eh:02d}{em:02d}")
-        return "/".join(norm_parts) if norm_parts else None
-    long_df[val_col] = long_df[val_col].apply(_norm_daily)
-    long_df.dropna(subset=[val_col], inplace=True)
-    ren = {}
-    if col_agent_id is not None: ren[col_agent_id] = "AgentID"
-    if col_emp_id is not None: ren[col_emp_id] = "EmpID"
-    if col_agent_name is not None: ren[col_agent_name] = "AgentName"
-    if col_tl is not None: ren[col_tl] = "TLName"
-    if col_lob is not None: ren[col_lob] = "LOB"
-    if col_center is not None: ren[col_center] = "Center"
-    if col_lang is not None: ren[col_lang] = "Language"
-    if col_workmode is not None: ren[col_workmode] = "WorkMode"
-    if col_base_shift is not None: ren[col_base_shift] = "BaseShift"
-    if col_status is not None: ren[col_status] = "Status"
-    if col_loc is not None: ren[col_loc] = "Location"
-    if col_lang2 is not None: ren[col_lang2] = "SecondaryLanguage"
-    if col_ftpt is not None: ren[col_ftpt] = "FTPT"
-    final_df = long_df.rename(columns=ren)
-    final_df.rename(columns={val_col: "Shift"}, inplace=True)
-    final_df["AgentID"] = final_df["AgentID"].astype(str).str.strip()
-    final_df["Language"] = final_df["Language"].astype(str).str.strip()
-    for c in ["LOB","Center"]:
-        if c in final_df.columns:
-            final_df[c] = final_df[c].astype(str).str.strip()
-    return final_df[[c for c in [
-        "AgentID","EmpID","AgentName","TLName","Status","WorkMode","Center","Location",
-        "Language","SecondaryLanguage","LOB","FTPT","BaseShift","Date","Shift"
-    ] if c in final_df.columns]]
 
 # =========================
 # Aggregation + Views
@@ -644,46 +724,80 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
 # UI
 # =========================
 st.title("📊 Center Shiftwise Web Dashboard")
-st.caption("Google Drive-backed • Streamlit • GitHub-ready")
+st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet (DuckDB read/write when configured)")
 
 with st.sidebar:
     st.subheader("🔐 Google Drive Setup")
-    st.write("- Add your service account JSON to **st.secrets['gcp_service_account']**.\n- Put your target folder id in **st.secrets['DRIVE_FOLDER_ID']**.")
+    st.write("- Add your service account JSON to **st.secrets['gcp_service_account']**.\n"
+             "- Put your target folder id in **st.secrets['DRIVE_FOLDER_ID']**.\n"
+             "- (Optional) Set **DUCKDB_FILE_NAME** (e.g., `cmb_delta.duckdb`) to enable DuckDB read/write.")
     if st.button("↻ Sync from Drive", use_container_width=True):
         load_parquet_from_drive.clear()
+        load_from_duckdb.clear()
         st.rerun()
 
     st.divider()
     st.subheader("⬆️ Import Files (Excel)")
     req_file = st.file_uploader("Requested workbook (.xlsx)", type=["xlsx"], key="req")
     if st.button("Import Requested", type="primary", use_container_width=True, disabled=not req_file):
-        records, roster = load_store()
+        # Parse new Requested rows
         new_req = parse_workbook_to_df(req_file.read())
         if new_req.empty:
             st.warning("No Requested data parsed.")
         else:
-            records = upsert_records(records, new_req)
-            save_parquet_to_drive(RECORDS_FILE, records)
-            st.success(f"Imported Requested rows: {len(new_req)}")
+            if DUCKDB_FILE_NAME:
+                # Download DB, UPSERT into records, upload back
+                local_db, file_id = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                if not local_db or not file_id:
+                    st.error(f"Could not find DuckDB file '{DUCKDB_FILE_NAME}' in Drive folder.")
+                else:
+                    try:
+                        affected = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, new_req)
+                        st.success(f"Imported/Upserted Requested rows: {affected}")
+                    except Exception as e:
+                        st.error(f"DuckDB upsert failed: {e}")
+            else:
+                # Fallback to Parquet store
+                records, roster = load_store()
+                records = pd.concat([records[~records.set_index(['Center','Language','Shift','Date']).index.isin(
+                    new_req.set_index(['Center','Language','Shift','Date']).index
+                )], new_req], ignore_index=True)
+                save_parquet_to_drive(RECORDS_FILE, records)
+                st.success(f"Imported Requested rows: {len(new_req)}")
 
     rost_file = st.file_uploader("Roster workbook (.xlsx)", type=["xlsx"], key="rost")
     if st.button("Import Roster (replace)", use_container_width=True, disabled=not rost_file):
-        records, roster = load_store()
         rr = read_roster_sheet(rost_file.read())
         if rr.empty:
             st.warning("No Roster data found (need a 'Roster' sheet)." )
         else:
             try:
-                norm = replace_roster(roster, rr)
-                save_parquet_to_drive(ROSTER_FILE, norm)
-                st.success(f"Roster imported. Rows: {len(norm)}")
+                # Normalize roster to long form using existing parser
+                # We reuse replace_roster logic's public surface (below we inline the transformation)
+                # Minimal reuse: we convert via the same function the app uses elsewhere
+                # -> Using the same 'replace_roster' function to normalize columns, returning final_df
+                norm = None
+                # Reuse the exact normalization code path (copy of function)
+                # To keep things consistent, we call the same function from above:
+                # replace_roster(old, raw) returns normalized df; here old is unused for schema matching.
+                norm = replace_roster(pd.DataFrame(), rr)
+                if DUCKDB_FILE_NAME:
+                    local_db, file_id = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                    if not local_db or not file_id:
+                        st.error(f"Could not find DuckDB file '{DUCKDB_FILE_NAME}' in Drive folder.")
+                    else:
+                        inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, norm)
+                        st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
+                else:
+                    save_parquet_to_drive(ROSTER_FILE, norm)
+                    st.success(f"Roster imported to Parquet. Rows: {len(norm)}")
             except Exception as e:
                 st.error(str(e))
 
     st.divider()
     st.subheader("📤 Export Current View")
 
-# Load current store
+# Load current store (DuckDB preferred if configured)
 records, roster = load_store()
 
 # Global filters (top row)
@@ -709,9 +823,9 @@ with c4:
 
 st.divider()
 
+# Show even if no language selected
 if not langs_sel:
-    st.info("Select at least one language to view data.")
-    st.stop()
+    st.warning("No language selected. Dashboard will be empty until you pick one.")
 
 # Build data for views
 req_shift = dedup_requested_split_pairs(pivot_requested(records, center, langs_sel, start, end))
