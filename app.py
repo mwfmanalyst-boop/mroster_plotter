@@ -944,15 +944,16 @@ with tab_plot:
     if ts_all.empty:
         st.info("No data to plot in the selected filters.")
     else:
+        # safety: make sure types are correct
         ts_all["Date"] = pd.to_datetime(ts_all["Date"])
-        chart = alt.Chart(ts_all).mark_line(point=True).encode(
-            x="yearmonthdate(Date):O",
-            y="Value:Q",
-            color="Metric:N",
-            tooltip=["Metric","Date","Value"]
-        ).properties(height=260, use_container_width=True)
-        st.altair_chart(chart, use_container_width=True)
+        ts_all["Value"] = pd.to_numeric(ts_all["Value"], errors="coerce").fillna(0)
 
+        chart = alt.Chart(ts_all).mark_line(point=True).encode(
+            x=alt.X("yearmonthdate(Date):T", title="Date"),
+            y=alt.Y("Value:Q", title="Count"),
+            color=alt.Color("Metric:N"),
+            tooltip=["Metric", alt.Tooltip("Date:T"), alt.Tooltip("Value:Q")]
+        ).properties(height=260, use_container_width=True)
     st.markdown("---")
 
     # ---- Shift-wise bar (sum over selected dates) ----
@@ -989,13 +990,15 @@ with tab_plot:
             heat = delt_interval.copy()
             heat.index.name = "Hour"
             heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
+            heat["Date"] = pd.to_datetime(heat["Date"])
+            heat["Hours"] = pd.to_numeric(heat["Hours"], errors="coerce").fillna(0)
+
             hchart = alt.Chart(heat).mark_rect().encode(
-                x=alt.X("yearmonthdate(Date):O", title="Date"),
-                y=alt.Y("Hour:O"),
-                color=alt.Color("Hours:Q"),
-                tooltip=["Date","Hour","Hours"]
+                x=alt.X("yearmonthdate(Date):T", title="Date"),
+                y=alt.Y("Hour:O", title="Hour of day"),
+                color=alt.Color("Hours:Q", title="Delta hours"),
+                tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")]
             ).properties(height=360, use_container_width=True)
-            st.altair_chart(hchart, use_container_width=True)
 
 with tab_roster:
     # Roster Filters
