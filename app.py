@@ -24,6 +24,13 @@ import duckdb
 # =========================
 st.set_page_config(page_title="Center Shiftwise Web Dashboard", layout="wide")
 
+# --- UI state ---
+if "active_tab" not in st.session_state:
+    st.session_state.active_tab = "Dashboard"  # "Dashboard" | "Plotter" | "Roster"
+
+if "busy_roster" not in st.session_state:
+    st.session_state.busy_roster = False
+
 # =========================
 # Secrets (read once)
 # =========================
@@ -1108,13 +1115,13 @@ with k2: st.metric("Rostered", _pretty_int(ros_shift.values.sum()))
 with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
 
 # =========================
-# Tabs: Dashboard | Plotter | Roster
+# PERSISTENT TABS + FULL RENDERERS
 # =========================
-tab_dash, tab_plot, tab_roster = st.tabs(["Dashboard", "Plotter", "Roster"])
 
-
-
-with tab_dash:
+# --- Renderers keep code organized and stop Streamlit from jumping tabs ---
+def render_dashboard(view_type: str,
+                     req_shift: pd.DataFrame, ros_shift: pd.DataFrame, delt_shift: pd.DataFrame,
+                     req_shift_total: pd.DataFrame, ros_shift_total: pd.DataFrame, delt_shift_total: pd.DataFrame):
     sub1, sub2, sub3 = st.columns(3)
     with sub1:
         st.subheader("Requested – Shift-wise")
@@ -1146,7 +1153,8 @@ with tab_dash:
             st.caption("Delta – Interval-wise")
             st.dataframe(add_total_row(delt_interval), use_container_width=True)
 
-with tab_plot:
+
+def render_plotter(req_shift: pd.DataFrame, ros_shift: pd.DataFrame, delt_shift: pd.DataFrame):
     st.subheader("📈 Plotter")
 
     # ---- Time-series totals by day ----
@@ -1161,17 +1169,14 @@ with tab_plot:
     ts_req = _series_from_pivot(req_shift, "Requested")
     ts_ros = _series_from_pivot(ros_shift, "Rostered")
     ts_del = _series_from_pivot(delt_shift, "Delta")
-
     _frames = [x for x in (ts_req, ts_ros, ts_del) if x is not None and not x.empty]
     ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date", "Value", "Metric"])
 
     if ts_all.empty:
         st.info("No data to plot in the selected filters.")
     else:
-        # safety: types
         ts_all["Date"] = pd.to_datetime(ts_all["Date"])
         ts_all["Value"] = pd.to_numeric(ts_all["Value"], errors="coerce").fillna(0)
-
         chart = (
             alt.Chart(ts_all)
             .mark_line(point=True)
@@ -1187,7 +1192,7 @@ with tab_plot:
 
     st.markdown("---")
 
-    # ---- Shift-wise bar (sum over selected dates) ----
+    # ---- Shift-wise bar ----
     def _melt_sum(p: pd.DataFrame, label: str) -> pd.DataFrame:
         if p is None or p.empty:
             return pd.DataFrame(columns=["Shift", "Value", "Metric"])
@@ -1248,55 +1253,106 @@ with tab_plot:
             )
             st.altair_chart(hchart, use_container_width=True)
 
-with tab_roster:
-    # Roster Filters
+
+def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
+    # When Language changes, mark UI as busy
+    def _roster_set_busy():
+        st.session_state.busy_roster = True
+
+    disabled = st.session_state.busy_roster
+
+    # --- Controls (disabled while busy) ---
     r1, r2, r3, r4, r5 = st.columns([1,1,1,1.3,1.2])
     with r1:
         lobs = roster_lobs(roster, center, start, end)
-        lob_sel = st.selectbox("LOB", ["(All)"] + lobs)
+        lob_sel = st.selectbox("LOB", ["(All)"] + lobs, disabled=disabled)
         lob = None if lob_sel in ("", "(All)") else lob_sel
     with r2:
         langs_lob = roster_languages_for_lob(roster, center, lob, start, end)
-        rlang_sel = st.selectbox("Language", ["(All)"] + langs_lob)
+        rlang_sel = st.selectbox("Language", ["(All)"] + langs_lob, key="rlang_sel",
+                                 on_change=_roster_set_busy, disabled=disabled)
         rlang = None if rlang_sel in ("", "(All)") else rlang_sel
     with r3:
         codes = roster_nonshift_codes(roster, center, start, end, lob, rlang)
-        nonshift_sel = st.selectbox("Non-Shift", ["(All)"] + codes)
+        nonshift_sel = st.selectbox("Non-Shift", ["(All)"] + codes, disabled=disabled)
     with r4:
         shifts_list = roster_distinct_shifts(roster, center, start, end, lob, rlang)
-        shift_sel = st.selectbox("Shift", ["(All)"] + shifts_list)
+        shift_sel = st.selectbox("Shift", ["(All)"] + shifts_list, disabled=disabled)
     with r5:
-        ids_text = st.text_input("Genesys IDs (comma/space)")
+        ids_text = st.text_input("Genesys IDs (comma/space)", disabled=disabled)
         ids = [x.strip() for x in re.findall(r"[A-Za-z0-9_]+", ids_text)] if ids_text else None
 
-    # Build wide table
-    wide = roster_agents_wide(roster, center, lob, rlang, ids, start, end)
-    if not wide.empty:
-        date_cols = [c for c in wide.columns if isinstance(c, (pd.Timestamp, date)) or re.match(r"\d{4}-\d{2}-\d{2}", str(c))]
-        static_cols = [c for c in wide.columns if c not in date_cols]
-        def is_time_like(s: str) -> bool:
-            return bool(re.fullmatch(r"\d{4}-\d{4}(?:/\d{4}-\d{4})*", str(s).strip()))
-        if nonshift_sel not in ("", "(All)"):
-            for c in date_cols:
-                wide[c] = wide[c].apply(lambda x: (str(x).strip() if (str(x).strip() and not is_time_like(str(x)) and str(x).strip().upper()==nonshift_sel.upper()) else ""))
-        elif shift_sel not in ("", "(All)"):
-            single_pat = re.compile(r"^\d{4}-\d{4}$")
+    # --- Build long (default) or wide table under spinner ---
+    with st.spinner("Loading roster…"):
+        # Long data frame first
+        dfr = roster[roster["Date"].between(start, end)].copy()
+        if center and center != "Overall":
+            dfr = dfr[dfr["Center"] == center]
+        if lob:
+            dfr = dfr[dfr["LOB"] == lob]
+        if rlang:
+            dfr = dfr[dfr["Language"] == rlang]
+        if ids:
+            dfr = dfr[dfr["AgentID"].isin(ids)]
+
+        # Normalize shift for robust filtering (desktop-equivalent)
+        if not dfr.empty and "Shift" in dfr.columns:
+            dfr["Shift"] = dfr["Shift"].apply(lambda s: (_normalize_shift_label(s) or str(s).strip().upper()))
+
+        # Apply Non-Shift / Shift filters on long data
+        if not dfr.empty:
             time_like = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
-            chosen_is_single = bool(single_pat.fullmatch(shift_sel))
-            def keep_if_matches(x: str) -> str:
-                s = str(x).strip()
-                if not s: return ""
-                if not time_like.fullmatch(s): return ""
-                if s == shift_sel: return s
-                if chosen_is_single and "/" in s:
-                    parts = [p.strip() for p in s.split("/") if p.strip()]
-                    if shift_sel in parts: return s
-                return ""
-            for c in date_cols:
-                wide[c] = wide[c].apply(keep_if_matches)
-        if nonshift_sel not in ("", "(All)") or shift_sel not in ("", "(All)"):
-            mask_rows = wide[date_cols].astype(str).apply(lambda r: any(v.strip() for v in r), axis=1)
-            wide = wide[mask_rows].copy()
-            nonempty_cols = [c for c in date_cols if wide[c].astype(str).str.strip().ne("").any()]
-            wide = pd.concat([wide[static_cols], wide[nonempty_cols]], axis=1)
-    st.dataframe(wide, use_container_width=True)
+            single_pat = re.compile(r"^\d{4}-\d{4}$")
+            if nonshift_sel not in ("", "(All)"):
+                dfr = dfr[
+                    (~dfr["Shift"].astype(str).str.match(time_like)) &
+                    (dfr["Shift"].astype(str).str.upper() == nonshift_sel.upper())
+                ]
+            elif shift_sel not in ("", "(All)"):
+                chosen_is_single = bool(single_pat.fullmatch(shift_sel))
+                def keep_shift(s: str) -> bool:
+                    s = str(s).strip()
+                    if not time_like.fullmatch(s):
+                        return False
+                    if s == shift_sel:
+                        return True
+                    if chosen_is_single and "/" in s:
+                        parts = [p.strip() for p in s.split("/") if p.strip()]
+                        return shift_sel in parts
+                    return False
+                dfr = dfr[dfr["Shift"].apply(keep_shift)]
+
+        # Columns for long display
+        static_cols = [c for c in [
+            "AgentID","AgentName","TLName","Status","WorkMode","Center","Location",
+            "Language","SecondaryLanguage","LOB","FTPT"
+        ] if c in dfr.columns]
+        long_cols = static_cols + ["Date", "Shift"]
+        long_df = dfr[long_cols] if not dfr.empty else pd.DataFrame(columns=long_cols)
+
+        # Default = LONG
+        st.caption("Roster (long format)")
+        st.dataframe(long_df, use_container_width=True)
+
+    # Unlock controls after load
+    st.session_state.busy_roster = False
+
+
+# ------- Persistent tab switcher (no auto-jump on rerun) -------
+tab_choice = st.radio(
+    "View",
+    ["Dashboard", "Plotter", "Roster"],
+    horizontal=True,
+    key="active_tab"
+)
+
+if tab_choice == "Dashboard":
+    render_dashboard(
+        view_type,
+        req_shift, ros_shift, delt_shift,
+        req_shift_total, ros_shift_total, delt_shift_total
+    )
+elif tab_choice == "Plotter":
+    render_plotter(req_shift, ros_shift, delt_shift)
+else:
+    render_roster(roster, center, start, end)
