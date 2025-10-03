@@ -302,6 +302,16 @@ def load_from_duckdb(db_name: str, _schema_version: int = 2) -> Tuple[pd.DataFra
     except Exception as e:
         df_roster = pd.DataFrame()
         diags["note"] += f" | roster_long read error: {e}"
+    # --- FINISH: close + diagnostics + return ---
+    try:
+        con.close()
+    except Exception:
+        pass
+
+    diags["records_rows"] = str(0 if df_records is None or df_records.empty else len(df_records))
+    diags["roster_rows"]  = str(0 if df_roster is None or df_roster.empty else len(df_roster))
+
+    return df_records, df_roster, diags
 
 
 # ============ DuckDB write helpers ============
@@ -553,13 +563,14 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
 
     if not roster.empty:
         roster["Date"] = pd.to_datetime(roster["Date"]).dt.date
-        for c in ["AgentID","Language","Center","LOB","Shift"]:
+        for c in ["AgentID", "Language", "Center", "LOB", "Shift"]:
             if c in roster.columns:
                 roster[c] = roster[c].astype(str).str.strip()
-                if "Shift" in roster.columns:
-                    roster["Shift"] = roster["Shift"].apply(
-                        lambda s: (_normalize_shift_label(s) or str(s).strip().upper())
-                    )
+        if "Shift" in roster.columns:
+            roster["Shift"] = roster["Shift"].apply(
+                lambda s: (_normalize_shift_label(s) or str(s).strip().upper())
+            )
+
     return records, roster, diags
 
 # =========================
