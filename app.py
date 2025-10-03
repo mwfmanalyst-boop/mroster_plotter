@@ -936,24 +936,25 @@ with tab_dash:
 with tab_plot:
     st.subheader("📈 Plotter")
 
-    # ---- Time-series totals by day (safe concat guards) ----
+    # ---- Time-series totals by day ----
     def _series_from_pivot(p: pd.DataFrame, label: str) -> pd.DataFrame:
-        if p.empty: return pd.DataFrame(columns=["Date","Value","Metric"])
+        if p is None or p.empty:
+            return pd.DataFrame(columns=["Date", "Value", "Metric"])
         s = p.sum(axis=0)
         out = pd.DataFrame({"Date": s.index, "Value": s.values})
         out["Metric"] = label
         return out
 
-    ts_req  = _series_from_pivot(req_shift, "Requested")
-    ts_ros  = _series_from_pivot(ros_shift, "Rostered")
-    ts_del  = _series_from_pivot(delt_shift, "Delta")
-    _frames = [x for x in [ts_req, ts_ros, ts_del] if x is not None and not x.empty]
-    ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date","Value","Metric"])
+    ts_req = _series_from_pivot(req_shift, "Requested")
+    ts_ros = _series_from_pivot(ros_shift, "Rostered")
+    ts_del = _series_from_pivot(delt_shift, "Delta")
+
+    _frames = [x for x in (ts_req, ts_ros, ts_del) if x is not None and not x.empty]
+    ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date", "Value", "Metric"])
 
     if ts_all.empty:
         st.info("No data to plot in the selected filters.")
     else:
-        else:
         # safety: types
         ts_all["Date"] = pd.to_datetime(ts_all["Date"])
         ts_all["Value"] = pd.to_numeric(ts_all["Value"], errors="coerce").fillna(0)
@@ -971,75 +972,68 @@ with tab_plot:
         )
         st.altair_chart(chart, use_container_width=True)
 
-st.markdown("---")
+    st.markdown("---")
 
     # ---- Shift-wise bar (sum over selected dates) ----
     def _melt_sum(p: pd.DataFrame, label: str) -> pd.DataFrame:
-        """
-        Melt a Shift-indexed pivot to long format and sum over dates.
-        Works even if the index name was lost.
-        """
         if p is None or p.empty:
             return pd.DataFrame(columns=["Shift", "Value", "Metric"])
-
         df = p.copy().reset_index()
-        # After reset_index, the former index becomes a column. Ensure it is named 'Shift'.
         if "Shift" not in df.columns:
-            # The first column after reset_index() is the former index column.
-            first_col = df.columns[0]
-            df = df.rename(columns={first_col: "Shift"})
-
+            df = df.rename(columns={df.columns[0]: "Shift"})
         m = df.melt(id_vars="Shift", var_name="Date", value_name="Value")
-        # Sum over all selected dates to make one bar per Shift per metric
         m = m.groupby("Shift", as_index=False)["Value"].sum()
         m["Metric"] = label
-        # numeric safety
         m["Value"] = pd.to_numeric(m["Value"], errors="coerce").fillna(0)
         return m
-
 
     m_req = _melt_sum(req_shift, "Requested")
     m_ros = _melt_sum(ros_shift, "Rostered")
     m_del = _melt_sum(delt_shift, "Delta")
-    _frames2 = [x for x in [m_req, m_ros, m_del] if x is not None and not x.empty]
-    m_all = pd.concat(_frames2, ignore_index=True) if _frames2 else pd.DataFrame(columns=["Shift","Value","Metric"])
+    _frames2 = [x for x in (m_req, m_ros, m_del) if x is not None and not x.empty]
+    m_all = pd.concat(_frames2, ignore_index=True) if _frames2 else pd.DataFrame(columns=["Shift", "Value", "Metric"])
 
-    if not m_all.empty:
-        chart2 = alt.Chart(m_all).mark_bar().encode(
-            x=alt.X("Shift:N", sort=None),
-            y=alt.Y("Value:Q", stack=None),
-            color="Metric:N",
-            tooltip=["Metric","Shift","Value"]
-        ).properties(height=300, use_container_width=True)
-        st.altair_chart(chart2, use_container_width=True)
-    else:
+    if m_all.empty:
         st.info("No shift-wise data to plot for the current filters.")
+    else:
+        chart2 = (
+            alt.Chart(m_all)
+            .mark_bar()
+            .encode(
+                x=alt.X("Shift:N", sort=None),
+                y=alt.Y("Value:Q", stack=None),
+                color="Metric:N",
+                tooltip=["Metric", "Shift", "Value"],
+            )
+            .properties(height=300, width="container")
+        )
+        st.altair_chart(chart2, use_container_width=True)
 
     st.markdown("---")
 
     # ---- Interval heatmap for Delta ----
-if not delt_shift.empty:
-    st.caption("Interval heatmap (Delta) – hours vs dates")
-    delt_interval = transform_to_interval_view(delt_shift)
-    if not delt_interval.empty:
-        heat = delt_interval.copy()
-        heat.index.name = "Hour"
-        heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
-        heat["Date"] = pd.to_datetime(heat["Date"])
-        heat["Hours"] = pd.to_numeric(heat["Hours"], errors="coerce").fillna(0)
+    if not delt_shift.empty:
+        st.caption("Interval heatmap (Delta) – hours vs dates")
+        delt_interval = transform_to_interval_view(delt_shift)
+        if not delt_interval.empty:
+            heat = delt_interval.copy()
+            heat.index.name = "Hour"
+            heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
+            heat["Date"] = pd.to_datetime(heat["Date"])
+            heat["Hours"] = pd.to_numeric(heat["Hours"], errors="coerce").fillna(0)
 
-        hchart = (
-            alt.Chart(heat)
-            .mark_rect()
-            .encode(
-                x=alt.X("yearmonthdate(Date):T", title="Date"),
-                y=alt.Y("Hour:O", title="Hour of day"),
-                color=alt.Color("Hours:Q", title="Delta hours"),
-                tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")],
+            hchart = (
+                alt.Chart(heat)
+                .mark_rect()
+                .encode(
+                    x=alt.X("yearmonthdate(Date):T", title="Date"),
+                    y=alt.Y("Hour:O", title="Hour of day"),
+                    color=alt.Color("Hours:Q", title="Delta hours"),
+                    tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")],
+                )
+                .properties(height=360, width="container")
             )
-            .properties(height=360, width="container")
-        )
-        st.altair_chart(hchart, use_container_width=True)
+            st.altair_chart(hchart, use_container_width=True)
 
 with tab_roster:
     # Roster Filters
