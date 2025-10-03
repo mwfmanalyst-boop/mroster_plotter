@@ -953,18 +953,25 @@ with tab_plot:
     if ts_all.empty:
         st.info("No data to plot in the selected filters.")
     else:
-        # safety: make sure types are correct
+        else:
+        # safety: types
         ts_all["Date"] = pd.to_datetime(ts_all["Date"])
         ts_all["Value"] = pd.to_numeric(ts_all["Value"], errors="coerce").fillna(0)
 
-        chart = alt.Chart(ts_all).mark_line(point=True).encode(
-            x=alt.X("yearmonthdate(Date):T", title="Date"),
-            y=alt.Y("Value:Q", title="Count"),
-            color=alt.Color("Metric:N"),
-            tooltip=["Metric", alt.Tooltip("Date:T"), alt.Tooltip("Value:Q")]
-        ).properties(height=260, use_container_width=True)
-        chart = alt.Chart(ts_all).mark_line(point=True).encode(
-    st.markdown("---")
+        chart = (
+            alt.Chart(ts_all)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("yearmonthdate(Date):T", title="Date"),
+                y=alt.Y("Value:Q", title="Count"),
+                color=alt.Color("Metric:N"),
+                tooltip=["Metric", alt.Tooltip("Date:T"), alt.Tooltip("Value:Q")],
+            )
+            .properties(height=260, width="container")
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+st.markdown("---")
 
     # ---- Shift-wise bar (sum over selected dates) ----
     def _melt_sum(p: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -1011,23 +1018,28 @@ with tab_plot:
     st.markdown("---")
 
     # ---- Interval heatmap for Delta ----
-    if not delt_shift.empty:
-        st.caption("Interval heatmap (Delta) – hours vs dates")
-        delt_interval = transform_to_interval_view(delt_shift)
-        if not delt_interval.empty:
-            heat = delt_interval.copy()
-            heat.index.name = "Hour"
-            heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
-            heat["Date"] = pd.to_datetime(heat["Date"])
-            heat["Hours"] = pd.to_numeric(heat["Hours"], errors="coerce").fillna(0)
+if not delt_shift.empty:
+    st.caption("Interval heatmap (Delta) – hours vs dates")
+    delt_interval = transform_to_interval_view(delt_shift)
+    if not delt_interval.empty:
+        heat = delt_interval.copy()
+        heat.index.name = "Hour"
+        heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
+        heat["Date"] = pd.to_datetime(heat["Date"])
+        heat["Hours"] = pd.to_numeric(heat["Hours"], errors="coerce").fillna(0)
 
-            hchart = alt.Chart(heat).mark_rect().encode(
+        hchart = (
+            alt.Chart(heat)
+            .mark_rect()
+            .encode(
                 x=alt.X("yearmonthdate(Date):T", title="Date"),
                 y=alt.Y("Hour:O", title="Hour of day"),
                 color=alt.Color("Hours:Q", title="Delta hours"),
-                tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")]
-            ).properties(height=360, use_container_width=True)
-            st.altair_chart(hchart, use_container_width=True)
+                tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")],
+            )
+            .properties(height=360, width="container")
+        )
+        st.altair_chart(hchart, use_container_width=True)
 
 with tab_roster:
     # Roster Filters
