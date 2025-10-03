@@ -880,20 +880,22 @@ with tab_plot:
         out["Metric"] = label
         return out
 
-    ts_req  = _series_from_pivot(req_shift, "Requested")
-    ts_ros  = _series_from_pivot(ros_shift, "Rostered")
-    ts_del  = _series_from_pivot(delt_shift, "Delta")
-    ts_all = pd.concat([x for x in [ts_req, ts_ros, ts_del] if not x.empty], ignore_index=True)
+
+    ts_req = _series_from_pivot(req_shift, "Requested")
+    ts_ros = _series_from_pivot(ros_shift, "Rostered")
+    ts_del = _series_from_pivot(delt_shift, "Delta")
+    _frames = [x for x in [ts_req, ts_ros, ts_del] if x is not None and not x.empty]
+    ts_all = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=["Date", "Value", "Metric"])
 
     if ts_all.empty:
         st.info("No data to plot in the selected filters.")
     else:
-        st.caption("Totals by day")
+        ts_all["Date"] = pd.to_datetime(ts_all["Date"])
         chart = alt.Chart(ts_all).mark_line(point=True).encode(
             x="yearmonthdate(Date):O",
             y="Value:Q",
             color="Metric:N",
-            tooltip=["Metric","Date","Value"]
+            tooltip=["Metric", "Date", "Value"]
         ).properties(height=260, use_container_width=True)
         st.altair_chart(chart, use_container_width=True)
 
@@ -909,18 +911,25 @@ with tab_plot:
             m = m.groupby("Shift", as_index=False)["Value"].sum()
             m["Metric"] = label
             return m
+
+
         m_req = _melt(req_shift, "Requested")
         m_ros = _melt(ros_shift, "Rostered")
         m_del = _melt(delt_shift, "Delta")
-        m_all = pd.concat([x for x in [m_req, m_ros, m_del] if not x.empty], ignore_index=True)
+        _frames2 = [x for x in [m_req, m_ros, m_del] if x is not None and not x.empty]
+        m_all = pd.concat(_frames2, ignore_index=True) if _frames2 else pd.DataFrame(
+            columns=["Shift", "Value", "Metric"])
+
         if not m_all.empty:
             chart2 = alt.Chart(m_all).mark_bar().encode(
                 x=alt.X("Shift:N", sort=None),
                 y=alt.Y("Value:Q", stack=None),
                 color="Metric:N",
-                tooltip=["Metric","Shift","Value"]
+                tooltip=["Metric", "Shift", "Value"]
             ).properties(height=300, use_container_width=True)
             st.altair_chart(chart2, use_container_width=True)
+        else:
+            st.info("No shift-wise data to plot for the current filters.")
 
     st.markdown("---")
 
