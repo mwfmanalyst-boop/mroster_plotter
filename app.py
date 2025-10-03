@@ -8,6 +8,7 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
 # Google Drive API (service account)
 from google.oauth2 import service_account
@@ -30,17 +31,13 @@ st.set_page_config(
 # -----------------------------
 def _get_drive_service():
     """Create a Drive service using the service account in Streamlit secrets."""
-    try:
-        info = st.secrets["gcp_service_account"]
-        scopes = ['https://www.googleapis.com/auth/drive']
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-        return build('drive', 'v3', credentials=creds, cache_discovery=False)
-    except KeyError:
+    info = st.secrets.get("gcp_service_account", None)
+    if not info:
         st.error("Google Drive auth failed. Please add service account JSON to st.secrets['gcp_service_account'].")
-        raise
-    except Exception as e:
-        st.error(f"Google Drive auth failed: {e}")
-        raise
+        raise RuntimeError("Missing gcp_service_account in secrets.")
+    scopes = ['https://www.googleapis.com/auth/drive']
+    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
     """Find a file by exact name (and parent folder if provided). Returns file id or None."""
@@ -58,13 +55,12 @@ def _drive_download_bytes(service, file_id: str) -> bytes:
     downloader = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
-        status, done = downloader.next_chunk()
+        _, done = downloader.next_chunk()
     return buf.getvalue()
 
 def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: Optional[str], file_id: Optional[str] = None) -> str:
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
     if file_id:
-        # update
         file = service.files().update(fileId=file_id, media_body=media).execute()
         return file["id"]
     else:
@@ -74,16 +70,14 @@ def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: O
         file = service.files().create(body=meta, media_body=media, fields="id").execute()
         return file["id"]
 
+# ===== Parquet helpers (fallback store) =====
 @st.cache_data(ttl=300)
 def load_parquet_from_drive(name: str) -> pd.DataFrame:
-    """Download name.parquet from Drive; return empty DF if missing."""
     service = _get_drive_service()
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID", None)
+    folder_id = st.secrets.get("DRIVE_FOLDER_ID")
     file_id = _drive_find_file_id(service, name, folder_id)
-    if not file_id:
-        return pd.DataFrame()
+    if not file_id: return pd.DataFrame()
     raw = _drive_download_bytes(service, file_id)
-    # Try parquet, fallback csv
     try:
         return pd.read_parquet(io.BytesIO(raw))
     except Exception:
@@ -94,12 +88,11 @@ def load_parquet_from_drive(name: str) -> pd.DataFrame:
 
 def save_parquet_to_drive(name: str, df: pd.DataFrame):
     service = _get_drive_service()
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID", None)
+    folder_id = st.secrets.get("DRIVE_FOLDER_ID")
     file_id = _drive_find_file_id(service, name, folder_id)
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
     _drive_upload_bytes(service, name, buf.getvalue(), "application/vnd.apache.parquet", folder_id, file_id)
-    # Bust cache
     load_parquet_from_drive.clear()
 
 # -----------------------------
@@ -107,39 +100,46 @@ def save_parquet_to_drive(name: str, df: pd.DataFrame):
 # -----------------------------
 DUCKDB_FILE_NAME = st.secrets.get("DUCKDB_FILE_NAME", None)  # e.g., "cmb_delta.duckdb"
 
-def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str]]:
-    """Download DuckDB file from Drive to a temp path (read-write). Returns (local_path, file_id)."""
-    service = _get_drive_service()
-    folder_id = st.secrets.get("DRIVE_FOLDER_ID", None)
-    file_id = _drive_find_file_id(service, name, folder_id)
-    if not file_id:
-        return None, None
-    raw = _drive_download_bytes(service, file_id)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
-    tmp.write(raw); tmp.flush(); tmp.close()
-    return tmp.name, file_id
+def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Download DuckDB file from Drive to a temp path (read-write). Returns (local_path, file_id, error_msg)."""
+    try:
+        service = _get_drive_service()
+        folder_id = st.secrets.get("DRIVE_FOLDER_ID")
+        file_id = _drive_find_file_id(service, name, folder_id)
+        if not file_id:
+            return None, None, f"File '{name}' not found in folder {folder_id}."
+        raw = _drive_download_bytes(service, file_id)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
+        tmp.write(raw); tmp.flush(); tmp.close()
+        return tmp.name, file_id, None
+    except Exception as e:
+        return None, None, f"DuckDB download error: {e}"
 
 def _upload_duckdb_back(local_path: str, file_id: str, name: str):
-    """Upload the modified DuckDB file back to Drive (overwrite by id)."""
     service = _get_drive_service()
     with open(local_path, "rb") as f:
         data = f.read()
     _drive_upload_bytes(service, name, data, "application/octet-stream", st.secrets.get("DRIVE_FOLDER_ID"), file_id)
 
 @st.cache_data(ttl=300)
-def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     """
     Download db_name from Drive and read expected tables into DataFrames (read-only).
-    Expected tables:
-      - records(Center, Language, Shift, Date, Value [, Metric])
-      - roster_long(AgentID, Center, Language, LOB, Shift, Date, ...)
+    Returns (records_df, roster_df, diagnostics).
     """
-    # Use read-only connection by making a copy to tmp
-    local_path, _ = _download_duckdb_rw(db_name)
-    if not local_path:
-        return pd.DataFrame(), pd.DataFrame()
+    diags = {"db_file": db_name, "found": "no", "records_rows": "0", "roster_rows": "0", "note": ""}
+    local_path, file_id, err = _download_duckdb_rw(db_name)
+    if err:
+        diags["note"] = err
+        return pd.DataFrame(), pd.DataFrame(), diags
+    diags["found"] = "yes"
 
-    con = duckdb.connect(local_path, read_only=True)
+    try:
+        con = duckdb.connect(local_path, read_only=True)
+    except Exception as e:
+        diags["note"] = f"connect error: {e}"
+        return pd.DataFrame(), pd.DataFrame(), diags
+
     # records
     try:
         df_records = con.execute("""
@@ -148,14 +148,12 @@ def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """).df()
     except Exception:
         try:
-            df_records = con.execute("""
-                SELECT Center, Language, Shift, Date, Value
-                FROM records
-            """).df()
+            df_records = con.execute("SELECT Center, Language, Shift, Date, Value FROM records").df()
             df_records["Metric"] = "Requested"
             df_records = df_records[["Center","Language","Shift","Metric","Date","Value"]]
-        except Exception:
+        except Exception as e:
             df_records = pd.DataFrame()
+            diags["note"] += f" | records read error: {e}"
 
     # roster_long
     try:
@@ -165,11 +163,14 @@ def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
                    BaseShift, Date, Shift
             FROM roster_long
         """).df()
-    except Exception:
+    except Exception as e:
         df_roster = pd.DataFrame()
+        diags["note"] += f" | roster_long read error: {e}"
 
     con.close()
-    return df_records, df_roster
+    diags["records_rows"] = str(0 if df_records is None or df_records.empty else len(df_records))
+    diags["roster_rows"]  = str(0 if df_roster is None or df_roster.empty else len(df_roster))
+    return df_records, df_roster, diags
 
 # ============ DuckDB write helpers ============
 def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
@@ -204,14 +205,7 @@ def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
     """)
 
 def duckdb_upsert_records(local_db_path: str, file_id: str, name_in_drive: str, new_rows: pd.DataFrame) -> int:
-    """
-    UPSERT rows into records on (Center, Language, Shift, Date).
-    Reuploads DB to Drive after commit. Returns affected row count from new_rows.
-    """
-    if new_rows.empty:
-        return 0
-
-    # Ensure required columns and types
+    if new_rows.empty: return 0
     need_cols = ["Center","Language","Shift","Metric","Date","Value"]
     for c in need_cols:
         if c not in new_rows.columns:
@@ -223,8 +217,6 @@ def duckdb_upsert_records(local_db_path: str, file_id: str, name_in_drive: str, 
     con = duckdb.connect(local_db_path, read_only=False)
     _ensure_duckdb_schema(con)
     con.register("new_records_df", new_rows)
-
-    # Use MERGE for upsert
     con.execute("""
         MERGE INTO records AS t
         USING new_records_df AS s
@@ -239,43 +231,27 @@ def duckdb_upsert_records(local_db_path: str, file_id: str, name_in_drive: str, 
         VALUES (s.Center, s.Language, s.Shift, s.Metric, s.Date, s.Value);
     """)
     con.close()
-
-    # Upload back
     _upload_duckdb_back(local_db_path, file_id, name_in_drive)
-    # Bust the cache for readers
     load_from_duckdb.clear()
     return len(new_rows)
 
 def duckdb_replace_roster(local_db_path: str, file_id: str, name_in_drive: str, roster_df: pd.DataFrame) -> int:
-    """
-    REPLACE the roster_long table entirely with roster_df.
-    Reuploads DB to Drive after commit. Returns inserted row count.
-    """
-    if roster_df.empty:
-        return 0
-
-    # Normalize dtypes
+    if roster_df.empty: return 0
     roster_df = roster_df.copy()
     roster_df["Date"] = pd.to_datetime(roster_df["Date"]).dt.date
-
     con = duckdb.connect(local_db_path, read_only=False)
     _ensure_duckdb_schema(con)
     con.register("new_roster_df", roster_df)
-
     con.execute("DROP TABLE IF EXISTS roster_long;")
-    con.execute("""
-        CREATE TABLE roster_long AS
-        SELECT * FROM new_roster_df;
-    """)
+    con.execute("CREATE TABLE roster_long AS SELECT * FROM new_roster_df;")
     inserted = con.execute("SELECT COUNT(*) FROM roster_long;").fetchone()[0]
     con.close()
-
     _upload_duckdb_back(local_db_path, file_id, name_in_drive)
     load_from_duckdb.clear()
     return int(inserted)
 
 # =========================
-# Parsing helpers (ported)
+# Parsing helpers (Requested workbook)
 # =========================
 def _is_date_like(x) -> bool:
     try:
@@ -288,17 +264,14 @@ def _is_date_like(x) -> bool:
 def _is_language_token(x) -> bool:
     if not isinstance(x, str): return False
     s = x.strip()
-    if not s or s.lower().startswith("shift"):
-        return False
-    if any(ch.isdigit() for ch in s):
-        return False
+    if not s or s.lower().startswith("shift"): return False
+    if any(ch.isdigit() for ch in s): return False
     for ch in s:
         if not (ch.isalpha() or ch.isspace() or ch in "-_+/()"):
             return False
     return True
 
-def _find_language_header(df: pd.DataFrame, shift_row: int, shift_col: int,
-                          win: int = 16, rows_up: int = 3):
+def _find_language_header(df: pd.DataFrame, shift_row: int, shift_col: int, win: int = 16, rows_up: int = 3):
     ncols = df.shape[1]
     for up in range(1, rows_up + 1):
         r = shift_row - up
@@ -321,12 +294,16 @@ def _collect_contiguous_dates_in_row(df: pd.DataFrame, row: int, start_col: int)
 
 SHIFT_SPLIT = re.compile(r"\s*/\s*")
 WOCL_VARIANTS = re.compile(r"^\s*W\s*O\s*[\+&/ ]\s*C\s*L\s*$", re.I)
-TIME_RANGE_RE = re.compile(r"""^\s*(?:(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))(?:\s*/\s*(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))*\s*$""", re.X)
+TIME_RANGE_RE = re.compile(
+    r"""^\s*(?:(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))
+        (?:\s*/\s*(?:\d{1,2}[:.]?\d{2})\s*-\s*(?:\d{1,2}[:.]?\d{2}))*\s*$""",
+    re.X
+)
 
 def _is_off_code(s: str) -> Optional[str]:
     t = re.sub(r"\s+", "", str(s)).upper()
-    if t in {"WO", "OFF"}: return "WO"
-    if t in {"CL", "CO", "COMPOFF", "COMP-OFF"}: return "CL"
+    if t in {"WO","OFF"}: return "WO"
+    if t in {"CL","CO","COMPOFF","COMP-OFF"}: return "CL"
     if WOCL_VARIANTS.fullmatch(str(s)): return "WO+CL"
     return None
 
@@ -342,7 +319,7 @@ def _normalize_shift_label(s: str) -> Optional[str]:
     parts = SHIFT_SPLIT.split(txt)
     norm_parts = []
     for part in parts:
-        part = part.strip().upper().replace("HRS", "").replace("HR", "").replace(".", ":")
+        part = part.strip().upper().replace("HRS","").replace("HR","").replace(".",":")
         m = re.fullmatch(r"(\d{1,2})[:]?(\d{2})\s*-\s*(\d{1,2})[:]?(\d{2})", part)
         if not m: return None
         sh, sm, eh, em = map(int, m.groups())
@@ -354,7 +331,7 @@ def _normalize_shift_label(s: str) -> Optional[str]:
 def parse_center_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
     df = pd.read_excel(xls, sheet_name, header=None)
     if df.empty:
-        return pd.DataFrame(columns=['Center', 'Language', 'Shift', 'Metric', 'Date', 'Value'])
+        return pd.DataFrame(columns=['Center','Language','Shift','Metric','Date','Value'])
     nrows, ncols = df.shape
     out = []
     for i in range(1, nrows):
@@ -365,8 +342,7 @@ def parse_center_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
                 if not lang: continue
                 first_date_col = None
                 for c in range(j + 1, ncols):
-                    if _is_date_like(df.iat[i, c]):
-                        first_date_col = c; break
+                    if _is_date_like(df.iat[i, c]): first_date_col = c; break
                 if first_date_col is None: continue
                 dates, date_cols = _collect_contiguous_dates_in_row(df, i, first_date_col)
                 if not dates: continue
@@ -386,13 +362,13 @@ def parse_center_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
                         if pd.notna(v):
                             out.append((sheet_name, lang, shift_label_norm, "Requested", d, float(v)))
                     r += 1
-    cols = ['Center', 'Language', 'Shift', 'Metric', 'Date', 'Value']
+    cols = ['Center','Language','Shift','Metric','Date','Value']
     return pd.DataFrame(out, columns=cols) if out else pd.DataFrame(columns=cols)
 
 def parse_workbook_to_df(file_bytes: bytes) -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(file_bytes))
-    EXCLUDED_SHEETS = {"Settings", "Roster", "Overall"}
-    centers = [s for s in xls.sheet_names if s.casefold() not in {x.casefold() for x in EXCLUDED_SHEETS}]
+    EXCLUDED = {"Settings","Roster","Overall"}
+    centers = [s for s in xls.sheet_names if s.casefold() not in {x.casefold() for x in EXCLUDED}]
     parts = []
     for s in centers:
         try:
@@ -400,9 +376,7 @@ def parse_workbook_to_df(file_bytes: bytes) -> pd.DataFrame:
             if not d.empty: parts.append(d)
         except Exception as e:
             st.warning(f"Failed parsing '{s}': {e}")
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
-        columns=['Center', 'Language', 'Shift', 'Metric', 'Date', 'Value']
-    )
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['Center','Language','Shift','Metric','Date','Value'])
 
 def read_roster_sheet(file_bytes: bytes) -> pd.DataFrame:
     try:
@@ -414,40 +388,63 @@ def read_roster_sheet(file_bytes: bytes) -> pd.DataFrame:
 # =========================
 # Data model selection (DuckDB preferred)
 # =========================
-RECORDS_FILE = "records.parquet"          # columns: Center, Language, Shift, Metric, Date, Value
-ROSTER_FILE  = "roster_long.parquet"      # normalized agent/day roster
+RECORDS_FILE = "records.parquet"
+ROSTER_FILE  = "roster_long.parquet"
 
-def load_store() -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _centers_union(records: pd.DataFrame, roster: pd.DataFrame) -> List[str]:
+    a = set(records["Center"].unique().tolist()) if not records.empty and "Center" in records else set()
+    b = set(roster["Center"].unique().tolist())  if not roster.empty  and "Center" in roster  else set()
+    cs = sorted([c for c in (a | b) if c])
+    return ["Overall"] + cs
+
+def _languages_union(records: pd.DataFrame, roster: pd.DataFrame, center: Optional[str]) -> List[str]:
+    if center in (None, "", "Overall"):
+        a = set(records["Language"].unique().tolist()) if not records.empty and "Language" in records else set()
+        b = set(roster["Language"].unique().tolist())  if not roster.empty  and "Language" in roster  else set()
+    else:
+        a = set(records.loc[records["Center"]==center, "Language"].unique().tolist()) if not records.empty and "Center" in records else set()
+        b = set(roster.loc[roster["Center"]==center, "Language"].unique().tolist())  if not roster.empty and "Center" in roster else set()
+    return sorted([l for l in (a | b) if l])
+
+def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     """
-    Prefer loading from DUCKDB_FILE_NAME if provided; else load Parquet files.
+    Prefer DuckDB if DUCKDB_FILE_NAME is set; else load Parquet files.
+    Metric handling is tolerant: only filter to 'Requested' if present.
+    Returns (records, roster, diagnostics)
     """
+    diags = {"source":"parquet"}
     if DUCKDB_FILE_NAME:
-        records, roster = load_from_duckdb(DUCKDB_FILE_NAME)
+        records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME)
+        diags.update({"source":"duckdb", **d})
     else:
         records = load_parquet_from_drive(RECORDS_FILE)
         roster  = load_parquet_from_drive(ROSTER_FILE)
+        diags.update({"records_rows":str(0 if records.empty else len(records)),
+                      "roster_rows": str(0 if roster.empty  else len(roster)),
+                      "found":"n/a","db_file":"n/a","note":""})
 
-    # dtype + schema fixes
+    # Normalize / filter
     if not records.empty:
         records["Date"] = pd.to_datetime(records["Date"]).dt.date
-        if "Metric" in records.columns:
-            records = records[records["Metric"] == "Requested"].copy()
-        else:
+        if "Metric" not in records or records["Metric"].isna().all():
             records["Metric"] = "Requested"
+        if (records["Metric"] == "Requested").any():
+            records = records[records["Metric"] == "Requested"].copy()
+
     if not roster.empty:
         roster["Date"] = pd.to_datetime(roster["Date"]).dt.date
         for c in ["AgentID","Language","Center","LOB","Shift"]:
             if c in roster.columns:
                 roster[c] = roster[c].astype(str).str.strip()
-    return records, roster
+
+    return records, roster, diags
 
 # =========================
 # Aggregation + Views
 # =========================
 def _pretty_int(x: float) -> int:
     try:
-        xf = float(x)
-        return int(round(xf))
+        return int(round(float(x)))
     except Exception:
         return 0
 
@@ -457,18 +454,15 @@ def _minutes_of(label: str) -> Optional[int]:
     s = str(label).strip()
     if not _TIME_RE_SINGLE.fullmatch(s): return None
     sh, sm, eh, em = int(s[0:2]), int(s[2:4]), int(s[5:7]), int(s[7:9])
-    start = sh * 60 + sm
-    end = eh * 60 + em
+    start = sh*60 + sm
+    end   = eh*60 + em
     return (end - start) if end > start else None
 
 def dedup_requested_split_pairs(pivot_df: pd.DataFrame) -> pd.DataFrame:
     if pivot_df.empty: return pivot_df
     df = pivot_df.copy()
     idx = list(df.index)
-    single_seg_minutes = {}
-    for s in idx:
-        if "/" in str(s): single_seg_minutes[s] = None
-        else: single_seg_minutes[s] = _minutes_of(str(s))
+    single_seg_minutes = {s: (None if "/" in str(s) else _minutes_of(str(s))) for s in idx}
     for col in df.columns:
         val_to_5h, val_to_4h = {}, {}
         col_values = df[col]
@@ -479,8 +473,7 @@ def dedup_requested_split_pairs(pivot_df: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(v): continue
             try: vv = float(v)
             except Exception: continue
-            if mins == 300: val_to_5h.setdefault(vv, set()).add(s)
-            elif mins == 240: val_to_4h.setdefault(vv, set()).add(s)
+            (val_to_5h if mins==300 else val_to_4h).setdefault(vv, set()).add(s)
         for v in set(val_to_4h.keys()) & set(val_to_5h.keys()):
             for row_4h in val_to_4h[v]:
                 df.at[row_4h, col] = 0.0
@@ -492,57 +485,46 @@ def transform_to_interval_view(shift_df: pd.DataFrame) -> pd.DataFrame:
     shift_df = shift_df.copy(); shift_df.columns = cols_dates
     interval_df = pd.DataFrame(0.0, index=range(24), columns=cols_dates)
     def _minutes_pair(text: str) -> Optional[tuple[int,int]]:
-        t = str(text).upper().strip().replace("HRS","" ).replace("HR","" ).replace(".",":")
+        t = str(text).upper().strip().replace("HRS","").replace("HR","").replace(".",":")
         m = re.fullmatch(r"\s*(\d{1,2})[:]?(\d{2})\s*-\s*(\d{1,2})[:]?(\d{2})\s*", t)
         if not m: return None
         sh, sm, eh, em = map(int, m.groups())
-        if not (0 <= sh <= 23 and 0 <= eh <= 23 and 0 <= sm <= 59 and 0 <= em <= 59): return None
+        if not (0<=sh<=23 and 0<=eh<=23 and 0<=sm<=59 and 0<=em<=59): return None
         return sh*60+sm, eh*60+em
     def _add_span(to_date, start_min, end_min, counts):
-        nonlocal interval_df
         if end_min <= start_min: return
         if to_date not in interval_df.columns: interval_df[to_date] = 0.0
         for h in range(24):
             h_start, h_end = h*60, (h+1)*60
-            ov_start, ov_end = max(start_min, h_start), min(end_min, h_end)
-            dur = max(0, ov_end - ov_start)
+            dur = max(0, min(end_min, h_end) - max(start_min, h_start))
             if dur > 0:
                 interval_df.at[h, to_date] += float(counts) * (dur / 60.0)
     for shift_label, counts_series in shift_df.iterrows():
         if str(shift_label).upper() in {"WO","CL","WO+CL"}: continue
         for part in str(shift_label).split("/"):
-            part_clean = part.strip()
-            if re.fullmatch(r"\d{4}-\d{4}", part_clean):
-                smin = int(part_clean[:2]) * 60 + int(part_clean[2:4])
-                emin = int(part_clean[5:7]) * 60 + int(part_clean[7:9])
+            part = part.strip()
+            pair = None
+            if re.fullmatch(r"\d{4}-\d{4}", part):
+                smin = int(part[:2]) * 60 + int(part[2:4])
+                emin = int(part[5:7]) * 60 + int(part[7:9])
                 pair = (smin, emin)
             else:
-                pair = _minutes_pair(part_clean)
+                pair = _minutes_pair(part)
             if not pair: continue
-            start_min, end_min = pair
+            smin, emin = pair
             for day, count in counts_series.items():
                 if pd.isna(count) or float(count) == 0.0: continue
-                if end_min > start_min:
-                    _add_span(day, start_min, end_min, float(count))
+                if emin > smin:
+                    _add_span(day, smin, emin, float(count))
                 else:
-                    _add_span(day, start_min, 24*60, float(count))
-                    next_day = day + timedelta(days=1)
-                    _add_span(next_day, 0, end_min, float(count))
+                    _add_span(day, smin, 24*60, float(count))
+                    _add_span(day + timedelta(days=1), 0, emin, float(count))
     final_cols = sorted(set(cols_dates) | set(interval_df.columns))
     return interval_df.reindex(columns=final_cols, fill_value=0.0)
 
 # =========================
 # Query utilities (pandas)
 # =========================
-def centers(records: pd.DataFrame) -> List[str]:
-    cs = sorted(records["Center"].unique().tolist()) if not records.empty else []
-    return ["Overall"] + cs
-
-def languages(records: pd.DataFrame, center: Optional[str]) -> List[str]:
-    if records.empty: return []
-    if center in (None, "", "Overall"): return sorted(records["Language"].unique().tolist())
-    return sorted(records[records["Center"] == center]["Language"].unique().tolist())
-
 def union_dates(records: pd.DataFrame, roster: pd.DataFrame, center: Optional[str]) -> List[date]:
     rs = set()
     if not records.empty:
@@ -587,7 +569,6 @@ def roster_distinct_shifts(roster: pd.DataFrame, center: Optional[str], start: d
     for s in df["Shift"].dropna().astype(str):
         t = s.strip()
         if pat.fullmatch(t): vals.append(t)
-    # hide parts if combined exists
     combined = [s for s in vals if "/" in s]
     parts_set = set()
     for s in combined:
@@ -618,8 +599,7 @@ def pivot_roster_counts(roster: pd.DataFrame, center: str, languages_: List[str]
     df = roster[(roster["Date"].between(start, end)) & (roster["Language"].isin(languages_))].copy()
     if center != "Overall": df = df[df["Center"] == center]
     if df.empty: return pd.DataFrame()
-    time_rows = []
-    code_rows = []
+    time_rows, code_rows = [], []
     time_pat = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
     for _, row in df.iterrows():
         dt = row["Date"]; s = str(row["Shift"]).strip().upper()
@@ -640,10 +620,8 @@ def pivot_roster_counts(roster: pd.DataFrame, center: str, languages_: List[str]
         codes = cdf.groupby(["Date","Code"]).size().unstack("Code", fill_value=0)
         wocl = (codes.get("WO", 0) + codes.get("CL", 0)).astype(float)
         all_cols = sorted(set(p.columns) | set(wocl.index.tolist()))
-        if p.empty:
-            p = pd.DataFrame(columns=all_cols)
-        else:
-            p = p.reindex(columns=all_cols, fill_value=0.0)
+        if p.empty: p = pd.DataFrame(columns=all_cols)
+        else:       p = p.reindex(columns=all_cols, fill_value=0.0)
         p.loc["WO+CL"] = [float(wocl.get(c, 0.0)) for c in p.columns]
     return p
 
@@ -679,7 +657,6 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
     from openpyxl.utils import get_column_letter
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Build shift-wise tables
         req_s = dedup_requested_split_pairs(pivot_requested(records, center, languages_sel, start, end))
         ros_s = pivot_roster_counts(roster, center, languages_sel, start, end)
         all_dates = sorted(list(set(req_s.columns) | set(ros_s.columns)))
@@ -696,9 +673,9 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
             delt_s.to_excel(writer, sheet_name=sheet_name, index=True, startrow=1,
                             startcol=len(req_s.columns) + len(ros_s.columns) + 4)
             ws = writer.sheets[sheet_name]
-            # basic autofit
             for col_cells in ws.columns:
                 max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
+                from openpyxl.utils import get_column_letter
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
 
         if view_type in ["Interval_Wise Delta View", "Overall_Delta View"]:
@@ -717,6 +694,7 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
             ws = writer.sheets[sheet_name]
             for col_cells in ws.columns:
                 max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
+                from openpyxl.utils import get_column_letter
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
     return output.getvalue()
 
@@ -726,133 +704,138 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
 st.title("📊 Center Shiftwise Web Dashboard")
 st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet (DuckDB read/write when configured)")
 
+# Load store early for diagnostics
+records, roster, diags = load_store()
+
 with st.sidebar:
     st.subheader("🔐 Google Drive Setup")
-    st.write("- Add your service account JSON to **st.secrets['gcp_service_account']**.\n"
-             "- Put your target folder id in **st.secrets['DRIVE_FOLDER_ID']**.\n"
-             "- (Optional) Set **DUCKDB_FILE_NAME** (e.g., `cmb_delta.duckdb`) to enable DuckDB read/write.")
+    st.write("- Add service account JSON to **st.secrets['gcp_service_account']**."
+             "\n- Set **st.secrets['DRIVE_FOLDER_ID']** to the folder that contains your data."
+             "\n- Optionally set **st.secrets['DUCKDB_FILE_NAME']** (e.g., `cmb_delta.duckdb`) for DuckDB read/write.")
     if st.button("↻ Sync from Drive", use_container_width=True):
         load_parquet_from_drive.clear()
         load_from_duckdb.clear()
         st.rerun()
 
     st.divider()
+    st.subheader("🧪 Data Check")
+    st.write(f"**Source:** {diags.get('source')}")
+    if diags.get("source") == "duckdb":
+        st.write(f"**DuckDB file name:** {diags.get('db_file')}")
+        st.write(f"**Found in Drive?** {'✅ Yes' if diags.get('found')=='yes' else '❌ No'}")
+    st.write(f"**records rows:** {diags.get('records_rows')}")
+    st.write(f"**roster_long rows:** {diags.get('roster_rows')}")
+    if diags.get("note"): st.caption(f"_note_: {diags.get('note')}")
+    if (records.empty) and (roster.empty):
+        st.warning("Both `records` and `roster_long` are empty. Check filename, permissions, and table schemas.")
+
+    st.divider()
     st.subheader("⬆️ Import Files (Excel)")
     req_file = st.file_uploader("Requested workbook (.xlsx)", type=["xlsx"], key="req")
     if st.button("Import Requested", type="primary", use_container_width=True, disabled=not req_file):
-        # Parse new Requested rows
         new_req = parse_workbook_to_df(req_file.read())
         if new_req.empty:
             st.warning("No Requested data parsed.")
         else:
             if DUCKDB_FILE_NAME:
-                # Download DB, UPSERT into records, upload back
-                local_db, file_id = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                if not local_db or not file_id:
-                    st.error(f"Could not find DuckDB file '{DUCKDB_FILE_NAME}' in Drive folder.")
+                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                if err or not local_db or not file_id:
+                    st.error(f"DuckDB issue: {err or 'File not found.'}")
                 else:
                     try:
                         affected = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, new_req)
-                        st.success(f"Imported/Upserted Requested rows: {affected}")
+                        st.success(f"Upserted Requested rows: {affected}")
                     except Exception as e:
                         st.error(f"DuckDB upsert failed: {e}")
             else:
-                # Fallback to Parquet store
-                records, roster = load_store()
-                records = pd.concat([records[~records.set_index(['Center','Language','Shift','Date']).index.isin(
-                    new_req.set_index(['Center','Language','Shift','Date']).index
-                )], new_req], ignore_index=True)
-                save_parquet_to_drive(RECORDS_FILE, records)
+                # fallback to parquet store
+                cur = load_parquet_from_drive(RECORDS_FILE)
+                if cur.empty:
+                    out = new_req
+                else:
+                    keys = ["Center","Language","Shift","Date"]
+                    left = cur.merge(new_req[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+                    keep = left["_merge"] == "left_only"
+                    base = cur[keep].copy()
+                    out = pd.concat([base, new_req], ignore_index=True)
+                save_parquet_to_drive(RECORDS_FILE, out)
                 st.success(f"Imported Requested rows: {len(new_req)}")
 
     rost_file = st.file_uploader("Roster workbook (.xlsx)", type=["xlsx"], key="rost")
     if st.button("Import Roster (replace)", use_container_width=True, disabled=not rost_file):
-        rr = read_roster_sheet(rost_file.read())
-        if rr.empty:
-            st.warning("No Roster data found (need a 'Roster' sheet)." )
+        raw = read_roster_sheet(rost_file.read())
+        if raw.empty:
+            st.warning("No Roster data found (need a 'Roster' sheet).")
         else:
-            try:
-                # Normalize roster to long form using existing parser
-                # We reuse replace_roster logic's public surface (below we inline the transformation)
-                # Minimal reuse: we convert via the same function the app uses elsewhere
-                # -> Using the same 'replace_roster' function to normalize columns, returning final_df
-                norm = None
-                # Reuse the exact normalization code path (copy of function)
-                # To keep things consistent, we call the same function from above:
-                # replace_roster(old, raw) returns normalized df; here old is unused for schema matching.
-                norm = replace_roster(pd.DataFrame(), rr)
-                if DUCKDB_FILE_NAME:
-                    local_db, file_id = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                    if not local_db or not file_id:
-                        st.error(f"Could not find DuckDB file '{DUCKDB_FILE_NAME}' in Drive folder.")
-                    else:
-                        inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, norm)
-                        st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
+            # Minimal normalizer: keep as-is; just ensure Date/Shift exist in final table later.
+            # (If you used the advanced replace_roster before, you can plug it here.)
+            # For simplicity we *assume* your uploaded roster is already normalized like roster_long.
+            if DUCKDB_FILE_NAME:
+                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                if err or not local_db or not file_id:
+                    st.error(f"DuckDB issue: {err or 'File not found.'}")
                 else:
-                    save_parquet_to_drive(ROSTER_FILE, norm)
-                    st.success(f"Roster imported to Parquet. Rows: {len(norm)}")
-            except Exception as e:
-                st.error(str(e))
+                    try:
+                        # Try to coerce Date and Shift presence
+                        if "Date" not in raw or "Shift" not in raw:
+                            st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
+                        else:
+                            raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
+                            inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw)
+                            st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
+                    except Exception as e:
+                        st.error(f"DuckDB roster replace failed: {e}")
+            else:
+                save_parquet_to_drive(ROSTER_FILE, raw)
+                st.success(f"Roster imported to Parquet. Rows: {len(raw)}")
 
     st.divider()
     st.subheader("📤 Export Current View")
 
-# Load current store (DuckDB preferred if configured)
-records, roster = load_store()
-
-# Global filters (top row)
-c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.2, 1.4])
+# =========================
+# Top filter row (now using UNION of centers/languages)
+# =========================
+c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.3, 1.7])
 with c1:
-    center_vals = centers(records)
+    center_vals = _centers_union(records, roster)
     center = st.selectbox("Center", center_vals, index=0 if center_vals else None)
 with c2:
-    # Dates
     ds = union_dates(records, roster, center)
-    if ds:
-        start_default, end_default = ds[0], ds[-1]
-    else:
-        start_default = end_default = date.today()
+    if ds: start_default, end_default = ds[0], ds[-1]
+    else:  start_default = end_default = date.today()
     date_range = st.date_input("Date range", value=(start_default, end_default))
-    if isinstance(date_range, tuple): start, end = date_range
-    else: start, end = start_default, end_default
+    start, end = (date_range if isinstance(date_range, tuple) else (start_default, end_default))
 with c3:
     view_type = st.selectbox("View", ["Shift_Wise Delta View","Interval_Wise Delta View","Overall_Delta View"], index=0)
 with c4:
-    lang_choices = languages(records, center)
-    langs_sel = st.multiselect("Languages", lang_choices, default=lang_choices[:1] if lang_choices else [])
+    lang_choices = _languages_union(records, roster, center)
+    # default: select all to avoid empty views
+    langs_sel = st.multiselect("Languages", lang_choices, default=lang_choices)
 
 st.divider()
-
-# Show even if no language selected
-if not langs_sel:
-    st.warning("No language selected. Dashboard will be empty until you pick one.")
 
 # Build data for views
 req_shift = dedup_requested_split_pairs(pivot_requested(records, center, langs_sel, start, end))
 ros_shift = pivot_roster_counts(roster, center, langs_sel, start, end)
-
 all_dates = sorted(list(set(req_shift.columns) | set(ros_shift.columns)))
 all_shifts = sorted(list(set(req_shift.index) | set(ros_shift.index)))
-
 req_shift = req_shift.reindex(index=all_shifts, columns=all_dates, fill_value=0.0)
 ros_shift = ros_shift.reindex(index=all_shifts, columns=all_dates, fill_value=0.0)
 delt_shift = ros_shift - req_shift
-
 req_shift_total = add_total_row(req_shift)
 ros_shift_total = add_total_row(ros_shift)
 delt_shift_total = add_total_row(delt_shift)
 
 # KPI row
 k1, k2, k3 = st.columns(3)
-with k1:
-    st.metric("Requested", _pretty_int(req_shift.values.sum()))
-with k2:
-    st.metric("Rostered", _pretty_int(ros_shift.values.sum()))
-with k3:
-    st.metric("Delta", _pretty_int(delt_shift.values.sum()))
+with k1: st.metric("Requested", _pretty_int(req_shift.values.sum()))
+with k2: st.metric("Rostered", _pretty_int(ros_shift.values.sum()))
+with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
 
-# Tabs
-tab_dash, tab_roster = st.tabs(["Dashboard", "Roster"])
+# =========================
+# Tabs: Dashboard | Plotter | Roster
+# =========================
+tab_dash, tab_plot, tab_roster = st.tabs(["Dashboard", "Plotter", "Roster"])
 
 with tab_dash:
     sub1, sub2, sub3 = st.columns(3)
@@ -886,21 +869,76 @@ with tab_dash:
             st.caption("Delta – Interval-wise")
             st.dataframe(add_total_row(delt_interval), use_container_width=True)
 
-    # Export current view
-    exp_col1, exp_col2 = st.columns([1,3])
-    with exp_col1:
-        if st.button("Generate Excel Export", type="primary"):
-            try:
-                xbytes = export_excel(view_type, center, langs_sel, start, end, records, roster)
-                st.session_state["export_bytes"] = xbytes
-                st.success("Export generated.")
-            except Exception as e:
-                st.error(f"Export failed: {e}")
-    with exp_col2:
-        if "export_bytes" in st.session_state:
-            st.download_button("Download Excel", data=st.session_state["export_bytes"],
-                               file_name=f"view_export_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with tab_plot:
+    st.subheader("📈 Plotter")
+
+    # ---- Time-series totals by day ----
+    def _series_from_pivot(p: pd.DataFrame, label: str) -> pd.DataFrame:
+        if p.empty: return pd.DataFrame(columns=["Date","Value","Metric"])
+        s = p.sum(axis=0)
+        out = pd.DataFrame({"Date": s.index, "Value": s.values})
+        out["Metric"] = label
+        return out
+
+    ts_req  = _series_from_pivot(req_shift, "Requested")
+    ts_ros  = _series_from_pivot(ros_shift, "Rostered")
+    ts_del  = _series_from_pivot(delt_shift, "Delta")
+    ts_all = pd.concat([x for x in [ts_req, ts_ros, ts_del] if not x.empty], ignore_index=True)
+
+    if ts_all.empty:
+        st.info("No data to plot in the selected filters.")
+    else:
+        st.caption("Totals by day")
+        chart = alt.Chart(ts_all).mark_line(point=True).encode(
+            x="yearmonthdate(Date):O",
+            y="Value:Q",
+            color="Metric:N",
+            tooltip=["Metric","Date","Value"]
+        ).properties(height=260, use_container_width=True)
+        st.altair_chart(chart, use_container_width=True)
+
+    st.markdown("---")
+
+    # ---- Shift-wise stacked bar (sum over selected dates) ----
+    if not req_shift.empty or not ros_shift.empty:
+        st.caption("Shift-wise counts (sum over selected dates)")
+        # Build melted frames
+        def _melt(p: pd.DataFrame, label: str) -> pd.DataFrame:
+            if p.empty: return pd.DataFrame(columns=["Shift","Value","Metric"])
+            m = p.reset_index().melt(id_vars="Shift", var_name="Date", value_name="Value")
+            m = m.groupby("Shift", as_index=False)["Value"].sum()
+            m["Metric"] = label
+            return m
+        m_req = _melt(req_shift, "Requested")
+        m_ros = _melt(ros_shift, "Rostered")
+        m_del = _melt(delt_shift, "Delta")
+        m_all = pd.concat([x for x in [m_req, m_ros, m_del] if not x.empty], ignore_index=True)
+        if not m_all.empty:
+            chart2 = alt.Chart(m_all).mark_bar().encode(
+                x=alt.X("Shift:N", sort=None),
+                y=alt.Y("Value:Q", stack=None),
+                color="Metric:N",
+                tooltip=["Metric","Shift","Value"]
+            ).properties(height=300, use_container_width=True)
+            st.altair_chart(chart2, use_container_width=True)
+
+    st.markdown("---")
+
+    # ---- Interval heatmap for Delta ----
+    if not delt_shift.empty:
+        st.caption("Interval heatmap (Delta) – hours vs dates")
+        delt_interval = transform_to_interval_view(delt_shift)
+        if not delt_interval.empty:
+            heat = delt_interval.copy()
+            heat.index.name = "Hour"
+            heat = heat.reset_index().melt(id_vars="Hour", var_name="Date", value_name="Hours")
+            hchart = alt.Chart(heat).mark_rect().encode(
+                x=alt.X("yearmonthdate(Date):O", title="Date"),
+                y=alt.Y("Hour:O"),
+                color=alt.Color("Hours:Q"),
+                tooltip=["Date","Hour","Hours"]
+            ).properties(height=360, use_container_width=True)
+            st.altair_chart(hchart, use_container_width=True)
 
 with tab_roster:
     # Roster Filters
@@ -920,13 +958,12 @@ with tab_roster:
         shifts_list = roster_distinct_shifts(roster, center, start, end, lob, rlang)
         shift_sel = st.selectbox("Shift", ["(All)"] + shifts_list)
     with r5:
-        ids_text = st.text_input("Genesys IDs (comma/space)" )
+        ids_text = st.text_input("Genesys IDs (comma/space)")
         ids = [x.strip() for x in re.findall(r"[A-Za-z0-9_]+", ids_text)] if ids_text else None
 
     # Build wide table
     wide = roster_agents_wide(roster, center, lob, rlang, ids, start, end)
     if not wide.empty:
-        # Apply optional Non-Shift / Shift filter to cells
         date_cols = [c for c in wide.columns if isinstance(c, (pd.Timestamp, date)) or re.match(r"\d{4}-\d{2}-\d{2}", str(c))]
         static_cols = [c for c in wide.columns if c not in date_cols]
         def is_time_like(s: str) -> bool:
@@ -949,7 +986,6 @@ with tab_roster:
                 return ""
             for c in date_cols:
                 wide[c] = wide[c].apply(keep_if_matches)
-        # Drop empty rows/cols after filtering
         if nonshift_sel not in ("", "(All)") or shift_sel not in ("", "(All)"):
             mask_rows = wide[date_cols].astype(str).apply(lambda r: any(v.strip() for v in r), axis=1)
             wide = wide[mask_rows].copy()
