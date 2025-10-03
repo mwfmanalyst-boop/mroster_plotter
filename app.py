@@ -580,7 +580,7 @@ def union_dates(records: pd.DataFrame, roster: pd.DataFrame, center: Optional[st
         rs |= set(roster["Date"].unique().tolist()) if center in (None, "", "Overall") else set(roster.loc[roster["Center"]==center, "Date"].unique().tolist())
     return sorted(list(rs))
 
-def pivot_requested(records: pd.DataFrame, center: str, langs: List[str], start: date, end: date) -> pd.DataFrame:
+def pivot_requested(records, center, langs, start, end) -> pd.DataFrame:
     if records.empty or not langs: return pd.DataFrame()
     df = records[(records["Date"].between(start, end)) & (records["Language"].isin(langs))].copy()
     if center != "Overall": df = df[df["Center"] == center]
@@ -588,6 +588,7 @@ def pivot_requested(records: pd.DataFrame, center: str, langs: List[str], start:
     p = df.groupby(["Shift","Date"], as_index=False)["Value"].sum()
     p = p.pivot(index="Shift", columns="Date", values="Value").fillna(0.0)
     p = p.reindex(sorted(p.columns), axis=1)
+    p.index.name = "Shift"             # <-- add this
     return p
 
 def roster_lobs(roster: pd.DataFrame, center: Optional[str], start: date, end: date) -> List[str]:
@@ -640,7 +641,7 @@ def roster_nonshift_codes(roster: pd.DataFrame, center: Optional[str], start: da
             vals.append(t)
     return sorted(dict.fromkeys(vals), key=lambda x: x.upper())
 
-def pivot_roster_counts(roster: pd.DataFrame, center: str, languages_: List[str], start: date, end: date) -> pd.DataFrame:
+def pivot_roster_counts(roster, center, languages_, start, end) -> pd.DataFrame:
     if roster.empty or not languages_: return pd.DataFrame()
     df = roster[(roster["Date"].between(start, end)) & (roster["Language"].isin(languages_))].copy()
     if center != "Overall": df = df[df["Center"] == center]
@@ -652,10 +653,10 @@ def pivot_roster_counts(roster: pd.DataFrame, center: str, languages_: List[str]
         if s in {"WO","CL"}:
             code_rows.append((dt, s)); continue
         if time_pat.fullmatch(s):
-            parts = [p.strip() for p in s.split("/") if p.strip()]
-            for part in parts:
+            for part in [p.strip() for p in s.split("/") if p.strip()]:
                 if re.fullmatch(r"\d{4}-\d{4}", part):
                     time_rows.append((dt, part))
+
     p = pd.DataFrame()
     if time_rows:
         tdf = pd.DataFrame(time_rows, columns=["Date","Shift"])
@@ -666,9 +667,10 @@ def pivot_roster_counts(roster: pd.DataFrame, center: str, languages_: List[str]
         codes = cdf.groupby(["Date","Code"]).size().unstack("Code", fill_value=0)
         wocl = (codes.get("WO", 0) + codes.get("CL", 0)).astype(float)
         all_cols = sorted(set(p.columns) | set(wocl.index.tolist()))
-        if p.empty: p = pd.DataFrame(columns=all_cols)
-        else:       p = p.reindex(columns=all_cols, fill_value=0.0)
+        p = (pd.DataFrame(columns=all_cols) if p.empty else p.reindex(columns=all_cols, fill_value=0.0))
         p.loc["WO+CL"] = [float(wocl.get(c, 0.0)) for c in p.columns]
+
+    p.index.name = "Shift"             # <-- add this
     return p
 
 def add_total_row(df: pd.DataFrame) -> pd.DataFrame:
@@ -874,12 +876,19 @@ req_shift = dedup_requested_split_pairs(pivot_requested(records, center, langs_s
 ros_shift = pivot_roster_counts(roster, center, langs_sel, start, end)
 all_dates = sorted(list(set(req_shift.columns) | set(ros_shift.columns)))
 all_shifts = sorted(list(set(req_shift.index) | set(ros_shift.index)))
+
 req_shift = req_shift.reindex(index=all_shifts, columns=all_dates, fill_value=0.0)
 ros_shift = ros_shift.reindex(index=all_shifts, columns=all_dates, fill_value=0.0)
 delt_shift = ros_shift - req_shift
+
+# 🔧 ensure downstream melt() sees a 'Shift' column after reset_index()
+for _df in (req_shift, ros_shift, delt_shift):
+    _df.index.name = "Shift"
+
 req_shift_total = add_total_row(req_shift)
 ros_shift_total = add_total_row(ros_shift)
 delt_shift_total = add_total_row(delt_shift)
+
 
 # KPI row
 k1, k2, k3 = st.columns(3)
@@ -954,14 +963,33 @@ with tab_plot:
             color=alt.Color("Metric:N"),
             tooltip=["Metric", alt.Tooltip("Date:T"), alt.Tooltip("Value:Q")]
         ).properties(height=260, use_container_width=True)
+        chart = alt.Chart(ts_all).mark_line(point=True).encode(
     st.markdown("---")
 
     # ---- Shift-wise bar (sum over selected dates) ----
     def _melt_sum(p: pd.DataFrame, label: str) -> pd.DataFrame:
-        if p.empty: return pd.DataFrame(columns=["Shift","Value","Metric"])
-        m = p.reset_index().melt(id_vars="Shift", var_name="Date", value_name="Value")
-        m = m.groupby("Shift", as_index=False)["Value"].sum(); m["Metric"] = label
+        """
+        Melt a Shift-indexed pivot to long format and sum over dates.
+        Works even if the index name was lost.
+        """
+        if p is None or p.empty:
+            return pd.DataFrame(columns=["Shift", "Value", "Metric"])
+
+        df = p.copy().reset_index()
+        # After reset_index, the former index becomes a column. Ensure it is named 'Shift'.
+        if "Shift" not in df.columns:
+            # The first column after reset_index() is the former index column.
+            first_col = df.columns[0]
+            df = df.rename(columns={first_col: "Shift"})
+
+        m = df.melt(id_vars="Shift", var_name="Date", value_name="Value")
+        # Sum over all selected dates to make one bar per Shift per metric
+        m = m.groupby("Shift", as_index=False)["Value"].sum()
+        m["Metric"] = label
+        # numeric safety
+        m["Value"] = pd.to_numeric(m["Value"], errors="coerce").fillna(0)
         return m
+
 
     m_req = _melt_sum(req_shift, "Requested")
     m_ros = _melt_sum(ros_shift, "Rostered")
@@ -999,6 +1027,7 @@ with tab_plot:
                 color=alt.Color("Hours:Q", title="Delta hours"),
                 tooltip=[alt.Tooltip("Date:T"), "Hour:O", alt.Tooltip("Hours:Q")]
             ).properties(height=360, use_container_width=True)
+            st.altair_chart(hchart, use_container_width=True)
 
 with tab_roster:
     # Roster Filters
