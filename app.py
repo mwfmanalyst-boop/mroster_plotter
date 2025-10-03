@@ -1033,7 +1033,8 @@ with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
 # =========================
 # Tabs: Dashboard | Plotter | Roster
 # =========================
-tab_dash, tab_plot, tab_roster, tab_req = st.tabs(["Dashboard", "Plotter", "Roster"])
+tab_dash, tab_plot, tab_roster = st.tabs(["Dashboard", "Plotter", "Roster"])
+
 
 
 with tab_dash:
