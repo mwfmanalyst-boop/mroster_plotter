@@ -190,7 +190,7 @@ def _upload_duckdb_back(local_path: str, file_id: str, name: str):
     _drive_upload_bytes(service, name, data, "application/octet-stream", DRIVE_FOLDER_ID or None, file_id)
 
 @st.cache_data(ttl=300)
-def load_from_duckdb(db_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
+def load_from_duckdb(db_name: str, _schema_version: int = 2) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     """
     Read DuckDB tables into DataFrames. Returns (records, roster_long, diagnostics)
     """
@@ -522,8 +522,17 @@ def _languages_union(records: pd.DataFrame, roster: pd.DataFrame, center: Option
 def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     diags = {}
     if DUCKDB_FILE_NAME:
-        records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME)
-        diags.update({"source":"duckdb", **d})
+        # Cache-safe call: if a stale cached shape appears, clear and retry once
+        try:
+            records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME, _schema_version=2)
+        except Exception:
+            try:
+                load_from_duckdb.clear()
+            except Exception:
+                pass
+            records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME, _schema_version=2)
+        diags.update({"source": "duckdb", **d})
+
     else:
         records = load_parquet_from_drive(RECORDS_FILE)
         roster  = load_parquet_from_drive(ROSTER_FILE)
