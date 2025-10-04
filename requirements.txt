@@ -1,17 +1,32 @@
-streamlit==1.37.1
-pandas==2.2.2
 numpy>=1.26
-pyarrow>=15.0
-openpyxl>=3.1
-duckdb>=1.0.0
-altair>=5.2
-
-google-api-python-client>=2.136
+pyarrow>=15.0         # parquet read/write
+openpyxl>=3.1        # Excel read/write via pandas & export
+google-api-python-client>=2.135.0
 google-auth>=2.29.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
+duckdb>=1.0.0
+altair>=5.2
+google-api-python-client>=2.136
+# ---- Core UI ----
+streamlit==1.37.1
+altair==5.3.0
 
+# ---- Data stack (wheel-safe on Py 3.12) ----
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.5
+pyarrow==15.0.2          # parquet engine for pandas (has wheels)
+duckdb==1.0.0            # also has wheels
+
+# ---- Google / OAuth ----
+google-api-python-client==2.141.0
+google-auth==2.34.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+protobuf==4.25.3         # stable with the above google libs
+
+# ---- Auth helpers ----
+cryptography==42.0.8
 protobuf==4.25.3
-cryptography>=42.0.8
-
 streamlit-oauth==0.1.26
