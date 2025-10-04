@@ -141,12 +141,15 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
 
 def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
     """
-    Google SSO using streamlit-oauth with compatibility for multiple versions.
-    Tries positional constructor first (most version-agnostic).
+    Google SSO using streamlit-oauth with compatibility across package variants.
+    - Validates secrets
+    - Tries multiple authorize_button() signatures
     """
+    import inspect
+
     st.markdown("### 🔓 Login with Google (SSO)")
 
-    # Accept either redirect_url or redirect_uri in secrets
+    # Accept either redirect_url or redirect_uri
     redirect_url = google_cfg.get("redirect_url") or google_cfg.get("redirect_uri")
     authorize_url = google_cfg.get("authorize_url")
     token_url     = google_cfg.get("token_url")
@@ -161,13 +164,11 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
     if missing:
         st.info(
             "SSO not fully configured. Missing in `[oauth.google]` secrets: "
-            + ", ".join(missing) +
-            "\n\nTip: On Streamlit Cloud, set these in **Settings → Secrets**. "
-            "Also ensure your Google OAuth client’s **Authorized redirect URIs** include your Streamlit app URL."
+            + ", ".join(missing)
         )
         return None
 
-    # Try multiple constructor signatures to match the installed streamlit-oauth
+    # Build component using a few constructor variants
     try:
         from streamlit_oauth import OAuth2Component
     except Exception as e:
@@ -175,62 +176,50 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
         return None
 
     oauth2 = None
-    init_errors = []
+    ctor_errors = []
 
-    # Attempt 1: POSitional (client_id, client_secret, authorize_url, token_url, refresh_token_url, redirect_url)
+    # 1) Positional constructor (most version-agnostic)
     try:
-        oauth2 = OAuth2Component(
-            client_id, client_secret, authorize_url, token_url, token_url, redirect_url
-        )
-    except TypeError as e:
-        init_errors.append(f"positional ctor failed: {e}")
+        oauth2 = OAuth2Component(client_id, client_secret, authorize_url, token_url, token_url, redirect_url)
     except Exception as e:
-        init_errors.append(f"positional ctor failed: {e}")
+        ctor_errors.append(f"positional ctor: {e}")
 
-    # Attempt 2: common keyword style with access_token_url
+    # 2) access_token_url kwargs
     if oauth2 is None:
         try:
             oauth2 = OAuth2Component(
-                client_id=client_id,
-                client_secret=client_secret,
-                authorize_url=authorize_url,
-                access_token_url=token_url,
-                refresh_token_url=token_url,
-                redirect_url=redirect_url,
+                client_id=client_id, client_secret=client_secret,
+                authorize_url=authorize_url, access_token_url=token_url,
+                refresh_token_url=token_url, redirect_url=redirect_url
             )
-        except TypeError as e:
-            init_errors.append(f"access_token_url kwargs failed: {e}")
         except Exception as e:
-            init_errors.append(f"access_token_url kwargs failed: {e}")
+            ctor_errors.append(f"access_token_url kwargs: {e}")
 
-    # Attempt 3: some builds use *endpoint* naming
+    # 3) endpoint kwargs
     if oauth2 is None:
         try:
             oauth2 = OAuth2Component(
-                client_id=client_id,
-                client_secret=client_secret,
-                authorize_endpoint=authorize_url,
-                token_endpoint=token_url,
-                refresh_token_endpoint=token_url,
-                redirect_url=redirect_url,
+                client_id=client_id, client_secret=client_secret,
+                authorize_endpoint=authorize_url, token_endpoint=token_url,
+                refresh_token_endpoint=token_url, redirect_url=redirect_url
             )
-        except TypeError as e:
-            init_errors.append(f"endpoint kwargs failed: {e}")
         except Exception as e:
-            init_errors.append(f"endpoint kwargs failed: {e}")
+            ctor_errors.append(f"endpoint kwargs: {e}")
 
     if oauth2 is None:
-        st.error(
-            "SSO library failed to initialize. Your deployed `streamlit-oauth` has a different constructor.\n\n"
-            + " • " + "\n • ".join(init_errors)
-            + "\n\nFixes:\n"
-            + "1) Pin `streamlit-oauth==0.1.26` in requirements.txt (recommended), OR\n"
-            + "2) Keep this multi-try block and ensure your secrets are filled."
-        )
+        st.error("SSO library failed to initialize:\n• " + "\n• ".join(ctor_errors))
         return None
 
-    # Show button
-    result = oauth2.authorize_button(
+    # ——— authorize_button() compatibility shims ———
+    ab_sig = None
+    try:
+        ab_sig = str(inspect.signature(oauth2.authorize_button))
+    except Exception:
+        pass
+
+    attempts = []
+    # A. Full kwargs (newer builds)
+    attempts.append(dict(
         name="Sign in with Google",
         icon="https://www.google.com/favicon.ico",
         scope="openid email profile",
@@ -238,11 +227,50 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
         use_container_width=True,
         extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
         key="google_oauth_btn",
-    )
-    if not result:
+    ))
+    # B. Simpler kwargs (older builds don’t accept extras/use_container_width)
+    attempts.append(dict(
+        name="Sign in with Google",
+        icon="https://www.google.com/favicon.ico",
+        scope="openid email profile",
+        button_text="Continue with Google",
+        key="google_oauth_btn",
+    ))
+    # C. Positional only (very old builds)
+    attempts.append(("Sign in with Google", "https://www.google.com/favicon.ico"))
+
+    result = None
+    errors = []
+    for opts in attempts:
+        try:
+            if isinstance(opts, tuple):
+                result = oauth2.authorize_button(*opts)
+            else:
+                # Only pass kwargs that the method actually accepts
+                if ab_sig:
+                    filtered = {k:v for k,v in opts.items() if k in ab_sig}
+                    result = oauth2.authorize_button(**filtered)
+                else:
+                    result = oauth2.authorize_button(**opts)
+        except TypeError as e:
+            errors.append(f"type mismatch: {e}")
+            continue
+        except Exception as e:
+            errors.append(str(e))
+            continue
+        if result:
+            break
+
+    if result is None:
+        msg = "authorize_button() failed to run with known signatures."
+        if ab_sig:
+            msg += f"\nDetected signature: `{ab_sig}`"
+        if errors:
+            msg += "\nTries:\n• " + "\n• ".join(errors)
+        st.error(msg)
         return None
 
-    # Exchange and fetch user info
+    # Token → userinfo
     try:
         token = result.get("token", {})
         access_token = token.get("access_token")
