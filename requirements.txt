@@ -3,14 +3,11 @@ pandas
 numpy
 pyarrow
 openpyxl
-duckdb
 altair
-
+duckdb
 google-api-python-client
 google-auth
 google-auth-httplib2
 google-auth-oauthlib
-
 protobuf
-cryptography
 streamlit-oauth
