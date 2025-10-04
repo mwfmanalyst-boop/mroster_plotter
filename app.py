@@ -140,157 +140,76 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
     return None
 
 def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
-    """
-    Google SSO using streamlit-oauth with compatibility across package variants.
-    - Validates secrets
-    - Tries multiple authorize_button() signatures
-    """
-    import inspect
-
     st.markdown("### 🔓 Login with Google (SSO)")
 
-    # Accept either redirect_url or redirect_uri
-    redirect_url = google_cfg.get("redirect_url") or google_cfg.get("redirect_uri")
-    authorize_url = google_cfg.get("authorize_url")
-    token_url     = google_cfg.get("token_url")
-    user_info_url = google_cfg.get("user_info_url")
-    client_id     = google_cfg.get("client_id")
+    # Required fields
+    client_id = google_cfg.get("client_id")
     client_secret = google_cfg.get("client_secret")
+    authorize_url = google_cfg.get("authorize_url")
+    token_url = google_cfg.get("token_url")
+    user_info_url = google_cfg.get("user_info_url")
 
-    missing = [k for k,v in {
-        "client_id": client_id, "client_secret": client_secret, "authorize_url": authorize_url,
-        "token_url": token_url, "user_info_url": user_info_url, "redirect_url": redirect_url
-    }.items() if not v]
-    if missing:
-        st.info(
-            "SSO not fully configured. Missing in `[oauth.google]` secrets: "
-            + ", ".join(missing)
+    # Some configs name it redirect_url, some redirect_uri — accept both
+    redirect_uri = (
+        google_cfg.get("redirect_uri")
+        or google_cfg.get("redirect_url")
+    )
+
+    required = [client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri]
+    if not all(required):
+        st.error(
+            "SSO is not fully configured. Please set these in `secrets` under `[oauth.google]`:\n"
+            "client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri"
         )
         return None
 
-    # Build component using a few constructor variants
+    # Build component
+    oauth2 = OAuth2Component(
+        client_id=client_id,
+        client_secret=client_secret,
+        authorize_url=authorize_url,
+        token_url=token_url,
+        refresh_token_url=token_url,
+        redirect_url=redirect_uri,   # keep this too; some builds use it
+    )
+
+    # ---- IMPORTANT: your wheel expects positional (name, redirect_uri, scope) ----
     try:
-        from streamlit_oauth import OAuth2Component
-    except Exception as e:
-        st.error(f"Could not import streamlit_oauth: {e}")
-        return None
-
-    oauth2 = None
-    ctor_errors = []
-
-    # 1) Positional constructor (most version-agnostic)
-    try:
-        oauth2 = OAuth2Component(client_id, client_secret, authorize_url, token_url, token_url, redirect_url)
-    except Exception as e:
-        ctor_errors.append(f"positional ctor: {e}")
-
-    # 2) access_token_url kwargs
-    if oauth2 is None:
-        try:
-            oauth2 = OAuth2Component(
-                client_id=client_id, client_secret=client_secret,
-                authorize_url=authorize_url, access_token_url=token_url,
-                refresh_token_url=token_url, redirect_url=redirect_url
-            )
-        except Exception as e:
-            ctor_errors.append(f"access_token_url kwargs: {e}")
-
-    # 3) endpoint kwargs
-    if oauth2 is None:
-        try:
-            oauth2 = OAuth2Component(
-                client_id=client_id, client_secret=client_secret,
-                authorize_endpoint=authorize_url, token_endpoint=token_url,
-                refresh_token_endpoint=token_url, redirect_url=redirect_url
-            )
-        except Exception as e:
-            ctor_errors.append(f"endpoint kwargs: {e}")
-
-    if oauth2 is None:
-        st.error("SSO library failed to initialize:\n• " + "\n• ".join(ctor_errors))
-        return None
-
-    # ——— authorize_button() compatibility shims ———
-    ab_sig = None
-    try:
-        ab_sig = str(inspect.signature(oauth2.authorize_button))
-    except Exception:
-        pass
-
-    attempts = []
-    # A. Full kwargs (newer builds)
-    attempts.append(dict(
-        name="Sign in with Google",
-        icon="https://www.google.com/favicon.ico",
-        scope="openid email profile",
-        button_text="Continue with Google",
-        use_container_width=True,
-        extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
-        key="google_oauth_btn",
-    ))
-    # B. Simpler kwargs (older builds don’t accept extras/use_container_width)
-    attempts.append(dict(
-        name="Sign in with Google",
-        icon="https://www.google.com/favicon.ico",
-        scope="openid email profile",
-        button_text="Continue with Google",
-        key="google_oauth_btn",
-    ))
-    # C. Positional only (very old builds)
-    attempts.append(("Sign in with Google", "https://www.google.com/favicon.ico"))
-
-    # --- call authorize_button with the signature your build expects ---
-    result = None
-    errors = []
-
-    try:
-        # Most recent builds expect: (name, redirect_uri, scope, ...)
         result = oauth2.authorize_button(
-            "Sign in with Google",
-            redirect_url,                          # <— REQUIRED by your build
-            "openid email profile",
+            "Sign in with Google",            # name
+            redirect_uri,                     # <-- REQUIRED positional arg
+            "openid email profile",           # scope
             key="google_oauth_btn",
             use_container_width=True,
             extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
         )
     except TypeError as e:
-        errors.append(f"positional(name, redirect_uri, scope): {e}")
-
-    # Fallbacks for other variants (older wheels)
-    if result is None:
-        try:
-            result = oauth2.authorize_button(
-                name="Sign in with Google",
-                scope="openid email profile",
-                key="google_oauth_btn",
-            )
-        except Exception as e:
-            errors.append(f"kwargs(name, scope): {e}")
-
-    if result is None:
-        st.error("authorize_button() failed.\n• " + "\n• ".join(errors))
+        st.error(f"authorize_button() failed: {e}\n"
+                 "Check that `redirect_uri` is provided and matches the Authorized redirect URI in Google Cloud.")
         return None
 
-    # Token → userinfo
+    if not result:
+        return None
+
+    # Exchange the token & read profile
     try:
         token = result.get("token", {})
         access_token = token.get("access_token")
         if not access_token:
-            st.error("SSO token response did not include an access_token.")
+            st.error("SSO token missing from provider response.")
             return None
 
         userinfo = oauth2.get_user_info(access_token=access_token, user_info_url=user_info_url)
         email = (userinfo.get("email") or "").lower().strip()
-        name = userinfo.get("name") or email
+        name = userinfo.get("name") or email or "User"
         if not email:
-            st.error("SSO did not return an email address.")
+            st.error("Google did not return an email address.")
             return None
 
         role = _role_from_sso_email(email, admin_domains, viewer_domains)
         return {"name": name, "email": email, "role": role, "auth": "sso"}
-
     except Exception as e:
-        st.error(f"SSO flow failed: {e}")
+        st.error(f"SSO error: {e}")
         return None
 
 def _render_auth_gate():
