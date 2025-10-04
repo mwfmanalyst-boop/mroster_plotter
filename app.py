@@ -140,50 +140,88 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
     return None
 
 def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
+    """
+    Google SSO using streamlit-oauth.
+    Strictly validates secrets and maps to OAuth2Component's expected names.
+    """
     st.markdown("### 🔓 Login with Google (SSO)")
-    required = ["client_id","client_secret","authorize_url","token_url","user_info_url","redirect_uri"]
-    if not all(google_cfg.get(k) for k in required):
-        st.info("SSO not configured. Ask admin to fill [oauth.google] in secrets.")
+
+    # Accept either redirect_url or redirect_uri in secrets (be forgiving)
+    redirect_url = google_cfg.get("redirect_url") or google_cfg.get("redirect_uri")
+    authorize_url = google_cfg.get("authorize_url")
+    token_url     = google_cfg.get("token_url")
+    user_info_url = google_cfg.get("user_info_url")
+    client_id     = google_cfg.get("client_id")
+    client_secret = google_cfg.get("client_secret")
+
+    # Hard validation with friendly message (prevents TypeError in constructor)
+    missing = [k for k,v in {
+        "client_id": client_id, "client_secret": client_secret, "authorize_url": authorize_url,
+        "token_url": token_url, "user_info_url": user_info_url, "redirect_url": redirect_url
+    }.items() if not v]
+    if missing:
+        st.info(
+            "SSO not fully configured. Missing in `[oauth.google]` secrets: "
+            + ", ".join(missing) +
+            "\n\nTip: On Streamlit Cloud, set these in **Settings → Secrets**. See instructions below."
+        )
         return None
 
-    oauth2 = OAuth2Component(
-        client_id=google_cfg["client_id"],
-        client_secret=google_cfg["client_secret"],
-        authorize_url=google_cfg["authorize_url"],
-        token_url=google_cfg["token_url"],
-        refresh_token_url=google_cfg.get("token_url"),
-        redirect_url=google_cfg["redirect_uri"],
-    )
+    # IMPORTANT: streamlit-oauth expects 'access_token_url', not 'token_url'
+    try:
+        from streamlit_oauth import OAuth2Component
+        oauth2 = OAuth2Component(
+            client_id=client_id,
+            client_secret=client_secret,
+            authorize_url=authorize_url,
+            access_token_url=token_url,           # <-- correct parameter name
+            refresh_token_url=token_url,          # Google uses the same token endpoint
+            redirect_url=redirect_url,            # must exactly match your Google OAuth client redirect URI
+        )
+    except TypeError as e:
+        st.error(
+            "SSO library failed to initialize. Likely the wrong parameter names or empty values.\n"
+            f"Details: {e}"
+        )
+        return None
+    except Exception as e:
+        st.error(f"Could not initialize SSO: {e}")
+        return None
+
+    # Render the button and continue if the user completes login
     result = oauth2.authorize_button(
         name="Sign in with Google",
         icon="https://www.google.com/favicon.ico",
         scope="openid email profile",
         button_text="Continue with Google",
         use_container_width=True,
+        # optional: add Google-specific query params
+        extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
         key="google_oauth_btn",
     )
     if not result:
         return None
 
+    # Exchange and fetch user info
     try:
         token = result.get("token", {})
         access_token = token.get("access_token")
         if not access_token:
-            st.error("SSO token missing.")
+            st.error("SSO token response did not include an access_token.")
             return None
-        userinfo = oauth2.get_user_info(
-            access_token=access_token,
-            user_info_url=google_cfg["user_info_url"]
-        )
+
+        userinfo = oauth2.get_user_info(access_token=access_token, user_info_url=user_info_url)
         email = (userinfo.get("email") or "").lower().strip()
         name = userinfo.get("name") or email
         if not email:
             st.error("SSO did not return an email address.")
             return None
+
         role = _role_from_sso_email(email, admin_domains, viewer_domains)
         return {"name": name, "email": email, "role": role, "auth": "sso"}
+
     except Exception as e:
-        st.error(f"SSO error: {e}")
+        st.error(f"SSO flow failed: {e}")
         return None
 
 def _render_auth_gate():
