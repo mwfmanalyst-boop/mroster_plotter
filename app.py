@@ -144,7 +144,7 @@ def _inject_css():
         div[data-testid="stDataFrame"] tbody tr:nth-child(even) td {
             background: #f9fbff;
         }
-        /* Buttons full width in sidebar */
+        /* Buttons full width in sidebar (most Streamlit themes) */
         .stDownloadButton, .st-emotion-cache-1vt4y43 { width:100%; }
         </style>
         """,
@@ -171,9 +171,13 @@ if "override_drive_folder_id" not in st.session_state:
 # =========================
 SA_INFO = st.secrets.get("gcp_service_account", {})
 
-# 🗂 optional ID hints to skip name search for parquet files (faster)
+# Optional ID hints (speed-ups if you keep parquet copies in Drive)
 REQUESTED_PARQUET_FILE_ID = st.secrets.get("REQUESTED_PARQUET_FILE_ID", "").strip()
 ROSTER_PARQUET_FILE_ID    = st.secrets.get("ROSTER_PARQUET_FILE_ID", "").strip()
+
+# NEW: per-dataset Drive folder IDs for file pickers
+REQUESTED_FOLDER_ID = (st.secrets.get("REQUESTED_FOLDER_ID", "") or "").strip()
+ROSTER_FOLDER_ID    = (st.secrets.get("ROSTER_FOLDER_ID", "") or "").strip()
 
 def _current_drive_folder_id():
     return (st.session_state.override_drive_folder_id or st.secrets.get("DRIVE_FOLDER_ID", "")).strip()
@@ -257,6 +261,55 @@ def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: O
         meta["parents"] = [folder_id]
     file = service.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
     return file["id"]
+
+# Folder listing + download helpers for picker
+def _drive_list_folder_files(service, folder_id: str, include_exts: Optional[List[str]] = None) -> List[dict]:
+    """
+    List files (name,id,mimeType,modifiedTime,size) from a single folder (Shared Drives OK).
+    include_exts: filter by lowercase file extension (e.g. ['.xlsx','.parquet'])
+    """
+    if not folder_id:
+        return []
+    items = []
+    page_token = None
+    q = f"'{folder_id}' in parents and trashed = false"
+    while True:
+        resp = service.files().list(
+            q=q,
+            fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
+            pageSize=200,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            corpora="allDrives",
+            orderBy="modifiedTime desc"
+        ).execute()
+        for f in resp.get("files", []):
+            if include_exts:
+                ext = os.path.splitext(f.get("name",""))[1].lower()
+                if ext not in include_exts:
+                    continue
+            items.append(f)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+def _drive_download_any_by_id(service, file_id: str) -> bytes:
+    req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+def _pick_list_label(f: dict) -> str:
+    ts = (f.get("modifiedTime","") or "")[:19].replace("T"," ")
+    sz = f.get("size")
+    size_mb = (int(sz)/1_048_576) if sz else None
+    size_txt = f" • {size_mb:.1f} MB" if size_mb is not None else ""
+    return f"{f.get('name','(no name)')} — {ts}{size_txt}"
 
 # ⚡ local cache: avoid re-download when md5Checksum unchanged
 if "_file_cache" not in st.session_state:
@@ -535,7 +588,7 @@ def duckdb_upsert_roster(local_db_path: str, file_id: str, name_in_drive: str, r
     """)
     n = con.execute("SELECT COUNT(*) FROM patch_df;").fetchone()[0]
     con.close()
-    _upload_duckdb_back(local_db_path, file_id, name_in_drive)
+    _upload_duckdb_back(local_path=local_db_path, file_id=file_id, name=name_in_drive)
     load_from_duckdb.clear()
     return int(n)
 
@@ -705,7 +758,6 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
             records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME, _schema_version=2)
         diags.update({"source": "duckdb", **d})
     else:
-        # ⚡ use ID hints to avoid name search when possible
         records = load_parquet_from_drive(RECORDS_FILE, file_id_hint=REQUESTED_PARQUET_FILE_ID or None)
         roster  = load_parquet_from_drive(ROSTER_FILE,  file_id_hint=ROSTER_PARQUET_FILE_ID or None)
         diags.update({"source":"parquet",
@@ -733,7 +785,7 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     return records, roster, diags
 
 # =========================
-# Aggregation + Views (unchanged)
+# Aggregation + Views
 # =========================
 def _pretty_int(x: float) -> int:
     try: return int(round(float(x)))
@@ -996,7 +1048,7 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
     return output.getvalue()
 
-# === Requested editor helpers (unchanged) ===
+# === Requested editor helpers ===
 def _validate_shift_label_for_edit(s: str) -> Optional[str]:
     if pd.isna(s) or str(s).strip() == "":
         return None
@@ -1082,14 +1134,15 @@ with st.sidebar:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("🔐 Drive Setup")
     st.write("- Put service account JSON in **st.secrets['gcp_service_account']**.")
-    st.write("- Set **st.secrets['DRIVE_FOLDER_ID']** (or use Folder switcher below).")
+    st.write("- Set **REQUESTED_FOLDER_ID** and **ROSTER_FOLDER_ID** in secrets to enable file pickers.")
+    st.write("- Optional: **DUCKDB_FILE_ID** (for DB) / parquet file IDs for speed.")
     if st.button("↻ Sync now", use_container_width=True):
         load_from_duckdb.clear(); st.session_state["_file_cache"].clear()
         st.rerun()
 
     st.divider()
-    st.subheader("📁 Folder switcher")
-    folder_id_in = st.text_input("Shared Drive Folder ID", value=_current_drive_folder_id())
+    st.subheader("📁 Global Folder (DB fallback)")
+    folder_id_in = st.text_input("Global Folder ID", value=_current_drive_folder_id())
     if st.button("Use this Folder", use_container_width=True):
         st.session_state.override_drive_folder_id = folder_id_in.strip() or None
         load_from_duckdb.clear(); st.session_state["_file_cache"].clear()
@@ -1105,10 +1158,13 @@ with st.sidebar:
     if (records.empty) and (roster.empty):
         st.warning("Both `records` and `roster_long` are empty. Check access & file IDs.")
 
-    # 🗂 Source selector for Requested & Roster (upload OR fetch)
+    # ======================
+    # Requested: Upload OR Fetch (Folder Picker)
+    # ======================
     st.divider()
     st.subheader("⬆️ Requested (choose source)")
     req_src = st.radio("Source (Requested)", ["Upload Excel", "Fetch from Drive"], horizontal=True, key="req_src")
+
     if req_src == "Upload Excel":
         req_file = st.file_uploader("Requested workbook (.xlsx)", type=["xlsx"], key="req_up")
         if st.button("Import Requested", type="primary", use_container_width=True, disabled=(not req_file or not is_admin)):
@@ -1131,32 +1187,68 @@ with st.sidebar:
                                 st.error(f"DuckDB upsert failed: {e}")
                     else:
                         cur = load_parquet_from_drive(RECORDS_FILE, file_id_hint=REQUESTED_PARQUET_FILE_ID or None)
-                        out = new_req if cur.empty else pd.concat([cur[~cur.merge(new_req[["Center","Language","Shift","Date"]].drop_duplicates(), on=["Center","Language","Shift","Date"], how="left", indicator=True)["_merge"].eq("both")], new_req], ignore_index=True)
+                        out = new_req if cur.empty else pd.concat(
+                            [cur[~cur.merge(new_req[["Center","Language","Shift","Date"]].drop_duplicates(),
+                                            on=["Center","Language","Shift","Date"],
+                                            how="left", indicator=True)["_merge"].eq("both")],
+                             new_req], ignore_index=True)
                         save_parquet_to_drive(RECORDS_FILE, out)
                         st.success(f"Imported Requested rows: {len(new_req)}")
+
     else:
-        # Fetch from Drive by Folder and Filename / File ID
-        fid = st.text_input("File ID (optional, faster)", value=REQUESTED_PARQUET_FILE_ID)
-        fname = st.text_input("Filename (e.g., Requested.xlsx)")
-        folder = st.text_input("Folder ID (optional; overrides global)", value=_current_drive_folder_id())
-        if st.button("Fetch & Import", type="primary", use_container_width=True, disabled=not is_admin):
+        # Fetch from Drive by selecting a file from REQUESTED_FOLDER_ID
+        svc = _get_drive_service()
+        st.caption("Select a file from your Requested folder on Drive:")
+        exts = [".xlsx", ".xls", ".parquet", ".csv"]
+
+        if "_req_folder_list" not in st.session_state:
+            st.session_state._req_folder_list = []
+
+        cols = st.columns([1, 0.35])
+        with cols[0]:
+            req_folder_id_ui = st.text_input("Requested Folder ID", value=REQUESTED_FOLDER_ID, help="From secrets.toml → REQUESTED_FOLDER_ID; you can override here.")
+        with cols[1]:
+            if st.button("Refresh list", use_container_width=True):
+                st.session_state._req_folder_list = _drive_list_folder_files(svc, req_folder_id_ui, include_exts=exts)
+
+        # initial listing
+        if not st.session_state._req_folder_list and req_folder_id_ui:
+            st.session_state._req_folder_list = _drive_list_folder_files(svc, req_folder_id_ui, include_exts=exts)
+
+        file_options = st.session_state._req_folder_list or []
+        option_labels = [_pick_list_label(f) for f in file_options]
+        pick_idx = st.selectbox(
+            "Available files",
+            options=range(len(file_options)),
+            format_func=lambda i: option_labels[i] if option_labels else "",
+            index=0 if file_options else None
+        )
+        manual_file_id = st.text_input("Or paste a File ID (optional)")
+
+        can_fetch = bool(manual_file_id.strip() or (file_options and pick_idx is not None))
+        if st.button("Fetch & Import", type="primary", use_container_width=True, disabled=not (can_fetch and is_admin)):
             try:
                 if not is_admin:
                     st.error("Admin role required.")
                 else:
-                    svc = _get_drive_service()
-                    if fid.strip():
-                        meta = _drive_file_meta(svc, fid.strip())
-                        raw = _drive_download_bytes(svc, meta["id"])
+                    if manual_file_id.strip():
+                        raw = _drive_download_any_by_id(svc, manual_file_id.strip())
+                        chosen_name = "(by file id)"
                     else:
-                        # search by name in provided folder (or global)
-                        file_id = _drive_find_file_id(svc, fname.strip(), (folder or _current_drive_folder_id()) or None)
-                        if not file_id:
-                            st.error("File not found.")
-                            st.stop()
-                        raw = _drive_download_bytes(svc, file_id)
-                    # parse (supports xlsx with multiple centers)
-                    new_req = parse_workbook_to_df(raw)
+                        chosen = file_options[pick_idx]
+                        raw = _drive_download_any_by_id(svc, chosen["id"])
+                        chosen_name = chosen.get("name","")
+
+                    ext = os.path.splitext(chosen_name)[1].lower() if chosen_name else ""
+                    if ext in (".xlsx",".xls"):
+                        new_req = parse_workbook_to_df(raw)
+                    elif ext == ".parquet":
+                        new_req = pd.read_parquet(io.BytesIO(raw))
+                    elif ext == ".csv":
+                        new_req = pd.read_csv(io.BytesIO(raw))
+                    else:
+                        new_req = parse_workbook_to_df(raw)
+
                     if new_req.empty:
                         st.warning("No Requested data parsed.")
                     else:
@@ -1169,15 +1261,23 @@ with st.sidebar:
                                 st.success(f"Upserted Requested rows: {affected}")
                         else:
                             cur = load_parquet_from_drive(RECORDS_FILE, file_id_hint=REQUESTED_PARQUET_FILE_ID or None)
-                            out = new_req if cur.empty else pd.concat([cur[~cur.merge(new_req[["Center","Language","Shift","Date"]].drop_duplicates(), on=["Center","Language","Shift","Date"], how="left", indicator=True)["_merge"].eq("both")], new_req], ignore_index=True)
+                            out = new_req if cur.empty else pd.concat(
+                                [cur[~cur.merge(new_req[["Center","Language","Shift","Date"]].drop_duplicates(),
+                                                on=["Center","Language","Shift","Date"],
+                                                how="left", indicator=True)["_merge"].eq("both")],
+                                 new_req], ignore_index=True)
                             save_parquet_to_drive(RECORDS_FILE, out)
                             st.success(f"Imported Requested rows: {len(new_req)}")
             except Exception as e:
                 st.error(f"Fetch/Import failed: {e}")
 
+    # ======================
+    # Roster: Upload OR Fetch (Folder Picker)
+    # ======================
     st.divider()
     st.subheader("⬆️ Roster (choose source)")
     rost_src = st.radio("Source (Roster)", ["Upload Excel", "Fetch from Drive"], horizontal=True, key="rost_src")
+
     if rost_src == "Upload Excel":
         rost_file = st.file_uploader("Roster workbook (.xlsx)", type=["xlsx"], key="rost_up")
         if st.button("Import Roster (replace)", use_container_width=True, disabled=(not rost_file or not is_admin)):
@@ -1205,41 +1305,74 @@ with st.sidebar:
                     else:
                         save_parquet_to_drive(ROSTER_FILE, raw)
                         st.success(f"Roster imported to Parquet. Rows: {len(raw)}")
+
     else:
-        # Fetch roster from Drive
-        fid = st.text_input("File ID (optional, faster)", value=ROSTER_PARQUET_FILE_ID)
-        fname = st.text_input("Filename (e.g., Roster.xlsx)", key="rst_fname")
-        folder = st.text_input("Folder ID (optional; overrides global)", value=_current_drive_folder_id(), key="rst_folder")
-        if st.button("Fetch & Replace", type="primary", use_container_width=True, disabled=not is_admin):
+        svc = _get_drive_service()
+        st.caption("Select a file from your Roster folder on Drive:")
+        exts = [".xlsx", ".xls", ".parquet", ".csv"]
+
+        if "_rost_folder_list" not in st.session_state:
+            st.session_state._rost_folder_list = []
+
+        cols = st.columns([1, 0.35])
+        with cols[0]:
+            rost_folder_id_ui = st.text_input("Roster Folder ID", value=ROSTER_FOLDER_ID, help="From secrets.toml → ROSTER_FOLDER_ID; you can override here.")
+        with cols[1]:
+            if st.button("Refresh list", use_container_width=True, key="rst_refresh"):
+                st.session_state._rost_folder_list = _drive_list_folder_files(svc, rost_folder_id_ui, include_exts=exts)
+
+        if not st.session_state._rost_folder_list and rost_folder_id_ui:
+            st.session_state._rost_folder_list = _drive_list_folder_files(svc, rost_folder_id_ui, include_exts=exts)
+
+        file_options = st.session_state._rost_folder_list or []
+        option_labels = [_pick_list_label(f) for f in file_options]
+        pick_idx = st.selectbox(
+            "Available files",
+            options=range(len(file_options)),
+            format_func=lambda i: option_labels[i] if option_labels else "",
+            index=0 if file_options else None,
+            key="rst_pick"
+        )
+        manual_file_id = st.text_input("Or paste a File ID (optional)", key="rst_manual")
+
+        can_fetch = bool(manual_file_id.strip() or (file_options and pick_idx is not None))
+        if st.button("Fetch & Replace", type="primary", use_container_width=True, disabled=not (can_fetch and is_admin)):
             try:
                 if not is_admin:
                     st.error("Admin role required.")
                 else:
-                    svc = _get_drive_service()
-                    if fid.strip():
-                        meta = _drive_file_meta(svc, fid.strip())
-                        raw_bytes = _drive_download_bytes(svc, meta["id"])
+                    if manual_file_id.strip():
+                        raw_bytes = _drive_download_any_by_id(svc, manual_file_id.strip())
+                        chosen_name = "(by file id)"
                     else:
-                        file_id = _drive_find_file_id(svc, fname.strip(), (folder or _current_drive_folder_id()) or None)
-                        if not file_id:
-                            st.error("File not found.")
-                            st.stop()
-                        raw_bytes = _drive_download_bytes(svc, file_id)
-                    raw = read_roster_sheet(raw_bytes)
-                    if raw.empty:
-                        st.warning("No 'Roster' sheet found or no data.")
+                        chosen = file_options[pick_idx]
+                        raw_bytes = _drive_download_any_by_id(svc, chosen["id"])
+                        chosen_name = chosen.get("name","")
+
+                    ext = os.path.splitext(chosen_name)[1].lower() if chosen_name else ""
+                    if ext in (".xlsx",".xls"):
+                        raw_df = read_roster_sheet(raw_bytes)
+                    elif ext == ".parquet":
+                        raw_df = pd.read_parquet(io.BytesIO(raw_bytes))
+                    elif ext == ".csv":
+                        raw_df = pd.read_csv(io.BytesIO(raw_bytes))
+                    else:
+                        raw_df = read_roster_sheet(raw_bytes)
+
+                    if raw_df.empty:
+                        st.warning("No 'Roster' data found.")
                     else:
                         if DUCKDB_FILE_NAME:
                             local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
                             if err or not local_db or not file_id:
                                 st.error(f"DuckDB issue: {err or 'File not found.'}")
                             else:
-                                raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw)
+                                raw_df["Date"] = pd.to_datetime(raw_df["Date"]).dt.date
+                                inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw_df)
                                 st.success(f"Roster replaced. Rows: {inserted}")
                         else:
-                            save_parquet_to_drive(ROSTER_FILE, raw)
-                            st.success(f"Roster imported to Parquet. Rows: {len(raw)}")
+                            save_parquet_to_drive(ROSTER_FILE, raw_df)
+                            st.success(f"Roster imported. Rows: {len(raw_df)}")
             except Exception as e:
                 st.error(f"Fetch/Replace failed: {e}")
 
@@ -1317,7 +1450,7 @@ with k3:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# Renderers & Roster editor dialog (from previous version)
+# Renderers & Roster editor dialog
 # =========================
 def render_dashboard(view_type: str,
                      req_shift: pd.DataFrame, ros_shift: pd.DataFrame, delt_shift: pd.DataFrame,
@@ -1399,7 +1532,7 @@ class DBAdapter:
             save_parquet_to_drive(RECORDS_FILE, new_all)
             return len(df)
 
-# ===== Plotter (unchanged UI) =====
+# ===== Plotter (desktop-like)
 import re as _re
 from datetime import date as _date
 if "plot_grid" not in st.session_state:     st.session_state.plot_grid = None
