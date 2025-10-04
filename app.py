@@ -239,35 +239,36 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
     # C. Positional only (very old builds)
     attempts.append(("Sign in with Google", "https://www.google.com/favicon.ico"))
 
+    # --- call authorize_button with the signature your build expects ---
     result = None
     errors = []
-    for opts in attempts:
+
+    try:
+        # Most recent builds expect: (name, redirect_uri, scope, ...)
+        result = oauth2.authorize_button(
+            "Sign in with Google",
+            redirect_url,                          # <— REQUIRED by your build
+            "openid email profile",
+            key="google_oauth_btn",
+            use_container_width=True,
+            extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
+        )
+    except TypeError as e:
+        errors.append(f"positional(name, redirect_uri, scope): {e}")
+
+    # Fallbacks for other variants (older wheels)
+    if result is None:
         try:
-            if isinstance(opts, tuple):
-                result = oauth2.authorize_button(*opts)
-            else:
-                # Only pass kwargs that the method actually accepts
-                if ab_sig:
-                    filtered = {k:v for k,v in opts.items() if k in ab_sig}
-                    result = oauth2.authorize_button(**filtered)
-                else:
-                    result = oauth2.authorize_button(**opts)
-        except TypeError as e:
-            errors.append(f"type mismatch: {e}")
-            continue
+            result = oauth2.authorize_button(
+                name="Sign in with Google",
+                scope="openid email profile",
+                key="google_oauth_btn",
+            )
         except Exception as e:
-            errors.append(str(e))
-            continue
-        if result:
-            break
+            errors.append(f"kwargs(name, scope): {e}")
 
     if result is None:
-        msg = "authorize_button() failed to run with known signatures."
-        if ab_sig:
-            msg += f"\nDetected signature: `{ab_sig}`"
-        if errors:
-            msg += "\nTries:\n• " + "\n• ".join(errors)
-        st.error(msg)
+        st.error("authorize_button() failed.\n• " + "\n• ".join(errors))
         return None
 
     # Token → userinfo
