@@ -1455,40 +1455,63 @@ st.markdown("</div>", unsafe_allow_html=True)
 def render_dashboard(view_type: str,
                      req_shift: pd.DataFrame, ros_shift: pd.DataFrame, delt_shift: pd.DataFrame,
                      req_shift_total: pd.DataFrame, ros_shift_total: pd.DataFrame, delt_shift_total: pd.DataFrame):
-    st.subheader("📈 Dashboard")
-    sub1, sub2, sub3 = st.columns(3)
-    with sub1:
-        st.markdown("<div class='card'><h4>Requested – Shift-wise</h4>", unsafe_allow_html=True)
-        st.dataframe(req_shift_total, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with sub2:
-        st.markdown("<div class='card'><h4>Rostered – Shift-wise</h4>", unsafe_allow_html=True)
-        st.dataframe(ros_shift_total, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with sub3:
-        st.markdown("<div class='card'><h4>Delta – Shift-wise</h4>", unsafe_allow_html=True)
-        st.dataframe(delt_shift_total, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    if view_type in ["Interval_Wise Delta View", "Overall_Delta View"]:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("Interval views")
-        ci1, ci2, ci3 = st.columns(3)
+    """
+    Renders the dashboard based strictly on the selected view:
+      - Shift_Wise Delta View: ONLY shift-wise (3 tables)
+      - Interval_Wise Delta View: ONLY interval-wise (3 tables)
+      - Overall_Delta View: shift-wise (3 tables) THEN interval-wise (3 tables)
+    """
+
+    def _render_shiftwise():
+        st.subheader("📈 Shift-wise View")
+        sub1, sub2, sub3 = st.columns(3)
+        with sub1:
+            st.markdown("<div class='card'><h4>Requested – Shift-wise</h4>", unsafe_allow_html=True)
+            st.dataframe(req_shift_total, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+        with sub2:
+            st.markdown("<div class='card'><h4>Rostered – Shift-wise</h4>", unsafe_allow_html=True)
+            st.dataframe(ros_shift_total, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+        with sub3:
+            st.markdown("<div class='card'><h4>Delta – Shift-wise</h4>", unsafe_allow_html=True)
+            st.dataframe(delt_shift_total, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    def _render_intervalwise():
+        st.subheader("⏱️ Interval-wise View")
+        # build interval tables from the underlying shift pivots (no total in source)
         req_interval = transform_to_interval_view(req_shift)
         ros_interval = transform_to_interval_view(ros_shift)
         all_cols_i = sorted(list(set(req_interval.columns) | set(ros_interval.columns)))
         req_interval = req_interval.reindex(columns=all_cols_i, fill_value=0.0)
         ros_interval = ros_interval.reindex(columns=all_cols_i, fill_value=0.0)
         delt_interval = ros_interval - req_interval
-        with ci1:
-            st.caption("Requested – Interval-wise")
+
+        i1, i2, i3 = st.columns(3)
+        with i1:
+            st.markdown("<div class='card'><h4>Requested – Interval-wise</h4>", unsafe_allow_html=True)
             st.dataframe(add_total_row(req_interval), use_container_width=True)
-        with ci2:
-            st.caption("Rostered – Interval-wise")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with i2:
+            st.markdown("<div class='card'><h4>Rostered – Interval-wise</h4>", unsafe_allow_html=True)
             st.dataframe(add_total_row(ros_interval), use_container_width=True)
-        with ci3:
-            st.caption("Delta – Interval-wise")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with i3:
+            st.markdown("<div class='card'><h4>Delta – Interval-wise</h4>", unsafe_allow_html=True)
             st.dataframe(add_total_row(delt_interval), use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if view_type == "Shift_Wise Delta View":
+        _render_shiftwise()
+
+    elif view_type == "Interval_Wise Delta View":
+        _render_intervalwise()
+
+    else:  # "Overall_Delta View"
+        _render_shiftwise()
+        st.markdown("---")
+        _render_intervalwise()
 
 class DBAdapter:
     def __init__(self, records_df, roster_df):
@@ -1568,7 +1591,7 @@ def _grid_to_requested_df(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame
     if grid_df is None or grid_df.empty: return pd.DataFrame()
     cols = list(grid_df.columns)
     if not cols or cols[0] != "Shift": return pd.DataFrame()
-    parsed = []; 
+    parsed = [];
     for h in cols[1:]: parsed.append(_parse_ddmm_header_to_date(h, from_year))
     keep = [i+1 for i, d in enumerate(parsed) if d is not None]
     out_dates = [d for d in parsed if d is not None]
