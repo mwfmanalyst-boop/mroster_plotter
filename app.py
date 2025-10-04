@@ -142,118 +142,127 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
 
 def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
     """
-    Google SSO that works across streamlit_oauth variants (no get_user_info on some wheels).
-    - Uses positional args for OAuth2Component ctor
-    - Reads user info from the provider's userinfo endpoint with the access token
-      OR decodes id_token (JWT) as a fallback.
-    Returns: {"name": str, "email": str, "role": "admin"|"viewer", "auth": "sso"} or None
+    Google SSO (robust across streamlit_oauth variants) that avoids STATE mismatch by:
+      - using a stable, normalized redirect_uri that matches Google Console exactly
+      - clearing ?code&state after handling the callback
+    Returns: {"name", "email", "role", "auth":"sso"} or None
     """
-    import base64, json, requests
+    import base64, json, requests, time
+    from urllib.parse import urlencode
 
     st.markdown("### 🔓 Login with Google (SSO)")
 
-    # ---- required config
-    client_id     = google_cfg.get("client_id")
-    client_secret = google_cfg.get("client_secret")
-    authorize_url = google_cfg.get("authorize_url")   # e.g. https://accounts.google.com/o/oauth2/v2/auth
-    token_url     = google_cfg.get("token_url")       # e.g. https://oauth2.googleapis.com/token
-    user_info_url = google_cfg.get("user_info_url")   # e.g. https://www.googleapis.com/oauth2/v3/userinfo
-    redirect_uri  = google_cfg.get("redirect_uri") or google_cfg.get("redirect_url")
+    # ---- Required config
+    client_id     = (google_cfg.get("client_id") or "").strip()
+    client_secret = (google_cfg.get("client_secret") or "").strip()
+    authorize_url = (google_cfg.get("authorize_url") or "").strip()
+    token_url     = (google_cfg.get("token_url") or "").strip()
+    user_info_url = (google_cfg.get("user_info_url") or "").strip()
+    redirect_uri  = (google_cfg.get("redirect_uri") or google_cfg.get("redirect_url") or "").strip()
+
+    # >>> IMPORTANT: make redirect EXACTLY match what you registered in Google.
+    # If you registered it WITH a trailing slash, keep it. If WITHOUT, ensure no slash.
+    # Uncomment ONE of the following lines to force consistency if needed:
+    # redirect_uri = redirect_uri.rstrip("/")         # force NO trailing slash
+    # redirect_uri = redirect_uri.rstrip("/") + "/"   # force trailing slash
 
     if not all([client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri]):
         st.error(
-            "SSO is not fully configured. Please set in st.secrets['oauth']['google']:\n"
-            "client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri"
+            "SSO is not fully configured. Need: client_id, client_secret, authorize_url, "
+            "token_url, user_info_url, redirect_uri in st.secrets['oauth']['google']"
         )
         return None
 
-    # ---- build OAuth2 component (positional, some builds reject kwargs)
+    # Remember the redirect we are using this run (stays stable across reruns)
+    st.session_state.setdefault("_oauth_redirect_uri", redirect_uri)
+
+    # ---- Build the component (positional args to support older wheels)
     try:
         oauth2 = OAuth2Component(
-            client_id,
-            client_secret,
-            authorize_url,
-            token_url,     # token URL
-            token_url,     # refresh token URL (same for Google)
-            redirect_uri,  # redirect URI
+            client_id, client_secret, authorize_url,
+            token_url, token_url,                 # token + refresh token
+            st.session_state["_oauth_redirect_uri"]
         )
     except TypeError as e:
         st.error(f"OAuth2Component init failed: {e}")
         return None
 
-    # ---- render button
-    try:
-        result = oauth2.authorize_button(
-            "Sign in with Google",          # button label
-            redirect_uri,                   # positional redirect
-            "openid email profile",         # scope
-            key="google_oauth_btn",
-            use_container_width=True,
-            extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
-        )
-    except TypeError as e:
-        st.error(f"authorize_button() failed: {e}")
-        return None
-
-    if not result:
-        return None
-
-    # ---- helpers
+    # Helper: decode id_token payload without verification (good enough to read email/name)
     def _decode_jwt_payload(id_token: str) -> dict:
         try:
             parts = id_token.split(".")
             if len(parts) != 3:
                 return {}
             pad = lambda s: s + "=" * (-len(s) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(pad(parts[1])).decode("utf-8"))
-            return payload if isinstance(payload, dict) else {}
+            return json.loads(base64.urlsafe_b64decode(pad(parts[1])).decode("utf-8"))
         except Exception:
             return {}
 
     def _role(email: str) -> str:
         return _role_from_sso_email(email, admin_domains, viewer_domains)
 
-    # ---- retrieve token pieces
-    token = {}
-    if isinstance(result, dict):
-        # common shapes: {"token": {...}}, {"access_token": ...}, {"id_token": ...}
-        token = result.get("token", result)
+    # ---- Render the button / handle callback
+    # Some builds require positional redirect here too.
+    try:
+        result = oauth2.authorize_button(
+            "Sign in with Google",
+            st.session_state["_oauth_redirect_uri"],
+            "openid email profile",
+            key="google_oauth_btn",
+            use_container_width=True,
+            extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
+        )
+    except Exception as e:
+        st.error(f"authorize_button failed: {e}")
+        return None
 
+    # No click yet
+    if not result:
+        return None
+
+    # ---- We have a callback (Google redirected back)
+    # Different wheels return different shapes: {"token": {...}} or flat dict.
+    token = result.get("token", result if isinstance(result, dict) else {}) or {}
+
+    # Try userinfo with access_token first
+    email = name = None
     access_token = token.get("access_token")
     id_token     = token.get("id_token")
 
-    # ---- try userinfo endpoint first
-    email = name = None
     if access_token:
         try:
-            r = requests.get(
-                user_info_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=10,
-            )
+            r = requests.get(user_info_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
             if r.ok:
                 info = r.json() if r.content else {}
                 email = (info.get("email") or "").strip().lower()
-                name  = (info.get("name")
-                         or f"{info.get('given_name','')}".strip()
-                         or email
-                         or "User")
+                name = (info.get("name")
+                        or f"{info.get('given_name','')} {info.get('family_name','')}".strip()
+                        or email or "User")
         except Exception as e:
-            # non-fatal; we'll fall back to id_token
-            st.info(f"Note: userinfo fetch fallback to id_token ({e})")
+            st.info(f"Note: userinfo fetch failed, using id_token if present ({e})")
 
-    # ---- fallback to id_token (decode without verifying signature)
+    # Fallback: decode id_token
     if not email and id_token:
         payload = _decode_jwt_payload(id_token)
         email = (payload.get("email") or "").strip().lower()
-        name  = (payload.get("name")
-                 or f"{payload.get('given_name','')} {payload.get('family_name','')}".strip()
-                 or email
-                 or "User")
+        name = (payload.get("name")
+                or f"{payload.get('given_name','')} {payload.get('family_name','')}".strip()
+                or email or "User")
 
     if not email:
-        st.error("SSO error: Could not obtain user email from Google (no access_token userinfo and no usable id_token).")
+        st.error("SSO error: Could not obtain user email from Google (no userinfo and no usable id_token).")
         return None
+
+    # ---- Clear the ?code&state from the URL so a rerun doesn't re-process and fail STATE check
+    try:
+        # Streamlit ≥ 1.30
+        st.query_params.clear()
+    except Exception:
+        # Back-compat
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
 
     return {"name": name, "email": email, "role": _role(email), "auth": "sso"}
 
