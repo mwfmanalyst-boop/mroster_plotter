@@ -141,12 +141,12 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
 
 def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
     """
-    Google SSO using streamlit-oauth.
-    Strictly validates secrets and maps to OAuth2Component's expected names.
+    Google SSO using streamlit-oauth with compatibility for multiple versions.
+    Tries positional constructor first (most version-agnostic).
     """
     st.markdown("### 🔓 Login with Google (SSO)")
 
-    # Accept either redirect_url or redirect_uri in secrets (be forgiving)
+    # Accept either redirect_url or redirect_uri in secrets
     redirect_url = google_cfg.get("redirect_url") or google_cfg.get("redirect_uri")
     authorize_url = google_cfg.get("authorize_url")
     token_url     = google_cfg.get("token_url")
@@ -154,7 +154,6 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
     client_id     = google_cfg.get("client_id")
     client_secret = google_cfg.get("client_secret")
 
-    # Hard validation with friendly message (prevents TypeError in constructor)
     missing = [k for k,v in {
         "client_id": client_id, "client_secret": client_secret, "authorize_url": authorize_url,
         "token_url": token_url, "user_info_url": user_info_url, "redirect_url": redirect_url
@@ -163,39 +162,80 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
         st.info(
             "SSO not fully configured. Missing in `[oauth.google]` secrets: "
             + ", ".join(missing) +
-            "\n\nTip: On Streamlit Cloud, set these in **Settings → Secrets**. See instructions below."
+            "\n\nTip: On Streamlit Cloud, set these in **Settings → Secrets**. "
+            "Also ensure your Google OAuth client’s **Authorized redirect URIs** include your Streamlit app URL."
         )
         return None
 
-    # IMPORTANT: streamlit-oauth expects 'access_token_url', not 'token_url'
+    # Try multiple constructor signatures to match the installed streamlit-oauth
     try:
         from streamlit_oauth import OAuth2Component
-        oauth2 = OAuth2Component(
-            client_id=client_id,
-            client_secret=client_secret,
-            authorize_url=authorize_url,
-            access_token_url=token_url,           # <-- correct parameter name
-            refresh_token_url=token_url,          # Google uses the same token endpoint
-            redirect_url=redirect_url,            # must exactly match your Google OAuth client redirect URI
-        )
-    except TypeError as e:
-        st.error(
-            "SSO library failed to initialize. Likely the wrong parameter names or empty values.\n"
-            f"Details: {e}"
-        )
-        return None
     except Exception as e:
-        st.error(f"Could not initialize SSO: {e}")
+        st.error(f"Could not import streamlit_oauth: {e}")
         return None
 
-    # Render the button and continue if the user completes login
+    oauth2 = None
+    init_errors = []
+
+    # Attempt 1: POSitional (client_id, client_secret, authorize_url, token_url, refresh_token_url, redirect_url)
+    try:
+        oauth2 = OAuth2Component(
+            client_id, client_secret, authorize_url, token_url, token_url, redirect_url
+        )
+    except TypeError as e:
+        init_errors.append(f"positional ctor failed: {e}")
+    except Exception as e:
+        init_errors.append(f"positional ctor failed: {e}")
+
+    # Attempt 2: common keyword style with access_token_url
+    if oauth2 is None:
+        try:
+            oauth2 = OAuth2Component(
+                client_id=client_id,
+                client_secret=client_secret,
+                authorize_url=authorize_url,
+                access_token_url=token_url,
+                refresh_token_url=token_url,
+                redirect_url=redirect_url,
+            )
+        except TypeError as e:
+            init_errors.append(f"access_token_url kwargs failed: {e}")
+        except Exception as e:
+            init_errors.append(f"access_token_url kwargs failed: {e}")
+
+    # Attempt 3: some builds use *endpoint* naming
+    if oauth2 is None:
+        try:
+            oauth2 = OAuth2Component(
+                client_id=client_id,
+                client_secret=client_secret,
+                authorize_endpoint=authorize_url,
+                token_endpoint=token_url,
+                refresh_token_endpoint=token_url,
+                redirect_url=redirect_url,
+            )
+        except TypeError as e:
+            init_errors.append(f"endpoint kwargs failed: {e}")
+        except Exception as e:
+            init_errors.append(f"endpoint kwargs failed: {e}")
+
+    if oauth2 is None:
+        st.error(
+            "SSO library failed to initialize. Your deployed `streamlit-oauth` has a different constructor.\n\n"
+            + " • " + "\n • ".join(init_errors)
+            + "\n\nFixes:\n"
+            + "1) Pin `streamlit-oauth==0.1.26` in requirements.txt (recommended), OR\n"
+            + "2) Keep this multi-try block and ensure your secrets are filled."
+        )
+        return None
+
+    # Show button
     result = oauth2.authorize_button(
         name="Sign in with Google",
         icon="https://www.google.com/favicon.ico",
         scope="openid email profile",
         button_text="Continue with Google",
         use_container_width=True,
-        # optional: add Google-specific query params
         extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
         key="google_oauth_btn",
     )
