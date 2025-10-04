@@ -20,9 +20,133 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 import duckdb
 
 # =========================
+# ✨ NEW: Auth / RBAC (lightweight shell, SSO-ready)
+# =========================
+# How it works now:
+# - By default, runs in "demo auth" mode: a simple sign-in form that sets user & role in session.
+# - SSO/JWT-ready: if you put a JWT in query param `token` (or configure to read a header via reverse proxy)
+#   and set secrets["auth"]["jwt_public_key"], we will validate it and extract `email` and `role`.
+# - Roles supported: "admin" (full access), "viewer" (read-only, no edits).
+#
+# To wire a real SSO:
+# - Terminate auth at your proxy / IdP; forward a JWT as a query param or header.
+# - Provide the RS256 public key in st.secrets["auth"]["jwt_public_key"] (PEM).
+# - Ensure the token includes "email" and "role" claims (role in {"admin","viewer"}).
+#
+# IMPORTANT: All edit paths are gated on role == "admin".
+
+def _auth_try_decode_jwt(token: str) -> Optional[dict]:
+    try:
+        import jwt  # PyJWT
+    except Exception:
+        return None
+    pub = st.secrets.get("auth", {}).get("jwt_public_key")
+    if not pub:
+        return None
+    try:
+        data = jwt.decode(token, pub, algorithms=["RS256"], options={"verify_aud": False})
+        return data
+    except Exception:
+        return None
+
+def _auth_sign_in_ui():
+    st.markdown("<div class='card'><h3>🔐 Sign in</h3>", unsafe_allow_html=True)
+    demo = st.toggle("Use demo login (no SSO)", value=True, help="Disable to rely on JWT in ?token=…")
+    if demo:
+        email = st.text_input("Work email", value="user@example.com")
+        role = st.selectbox("Role", ["viewer", "admin"], index=1)
+        if st.button("Sign in", type="primary", use_container_width=True):
+            st.session_state["auth_user"] = {"email": email, "role": role}
+            st.rerun()
+    else:
+        st.info("Provide a JWT in the URL query like ?token=eyJ... (RS256).")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def require_auth():
+    # 1) Try JWT in query param (SSO mode)
+    params = st.experimental_get_query_params()
+    token = None
+    if "token" in params and params["token"]:
+        token = params["token"][0]
+    if token:
+        decoded = _auth_try_decode_jwt(token)
+        if decoded:
+            user = {
+                "email": decoded.get("email", "unknown@user"),
+                "role": decoded.get("role", "viewer"),
+                "claims": decoded
+            }
+            st.session_state["auth_user"] = user
+
+    user = st.session_state.get("auth_user")
+    if not user:
+        st.set_page_config(page_title="Center Shiftwise Web Dashboard", layout="wide")
+        _inject_css()  # minimal styling even on login page
+        st.title("📊 Center Shiftwise Web Dashboard")
+        _auth_sign_in_ui()
+        st.stop()
+
+    # Basic header bar
+    _top_nav(user)
+    return user
+
+def _top_nav(user: dict):
+    with st.container():
+        cols = st.columns([6, 2, 1])
+        with cols[0]:
+            st.markdown("<h1>📊 Center Shiftwise Web Dashboard</h1>", unsafe_allow_html=True)
+            st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet • SSO-ready (Role-based)")
+        with cols[1]:
+            st.markdown(
+                f"<div style='text-align:right;padding-top:10px;'>"
+                f"<b>{user.get('email','')}</b><br/><span class='badge'>{user.get('role','viewer')}</span>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with cols[2]:
+            if st.button("Sign out", use_container_width=True):
+                st.session_state.pop("auth_user", None)
+                st.experimental_set_query_params()  # clear ?token
+                st.rerun()
+
+# =========================
+# ✨ NEW: Modern UI styling (CSS)
+# =========================
+def _inject_css():
+    st.markdown(
+        """
+        <style>
+        :root{
+            --card-bg: #ffffff;
+            --card-br: 18px;
+            --card-shadow: 0 10px 25px rgba(0,0,0,0.06);
+            --accent: #4c8bf5;
+            --soft: #f6f8fe;
+        }
+        .block-container { padding-top: 1.5rem; max-width: 1400px; }
+        .badge{ background:#EEF2FF; color:#3730A3; padding:2px 8px; border-radius:999px; font-size:12px; }
+        .metric-card .stMetric { background:var(--card-bg); border-radius:var(--card-br); 
+            box-shadow: var(--card-shadow); padding: 12px 16px; }
+        .card{
+            background:var(--card-bg); border-radius:var(--card-br); padding:16px 18px; 
+            box-shadow: var(--card-shadow); margin-bottom: 16px;
+        }
+        .muted{ color:#6b7280; }
+        .stDataFrame { border-radius: 14px; overflow: hidden; box-shadow: var(--card-shadow); }
+        .stDownloadButton, .st-emotion-cache-1vt4y43 { width:100%; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+# =========================
 # Page + Global Config
 # =========================
 st.set_page_config(page_title="Center Shiftwise Web Dashboard", layout="wide")
+_injected_once = st.session_state.get("_css_injected", False)
+if not _injected_once:
+    _inject_css()
+    st.session_state["_css_injected"] = True
 
 # --- UI state ---
 if "active_tab" not in st.session_state:
@@ -31,11 +155,19 @@ if "active_tab" not in st.session_state:
 if "busy_roster" not in st.session_state:
     st.session_state.busy_roster = False
 
+# ✨ NEW: runtime override for Drive folder (so you can fetch by an ID you share)
+if "override_drive_folder_id" not in st.session_state:
+    st.session_state.override_drive_folder_id = None
+
 # =========================
 # Secrets (read once)
 # =========================
 SA_INFO = st.secrets.get("gcp_service_account", {})
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "").strip()
+# ✨ UPDATED: prefer runtime override if set
+def _current_drive_folder_id():
+    return (st.session_state.override_drive_folder_id or st.secrets.get("DRIVE_FOLDER_ID", "")).strip()
+
+DRIVE_FOLDER_ID = _current_drive_folder_id()
 DUCKDB_FILE_NAME = st.secrets.get("DUCKDB_FILE_NAME", "").strip() or "cmb_delta.duckdb"
 DUCKDB_FILE_ID = st.secrets.get("DUCKDB_FILE_ID", "").strip()  # optional but best
 
@@ -67,7 +199,6 @@ def _drive_get_file_by_id(service, file_id: str):
     ).execute()
 
 def _drive_find_file_id(service, name: str, folder_id: Optional[str]) -> Optional[str]:
-    """Find file by exact name (optionally inside folder). Works on Shared Drives and resolves shortcuts."""
     q = f"name = '{name}' and trashed = false"
     if folder_id:
         q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
@@ -129,11 +260,11 @@ def _drive_list_folder(service, folder_id: str) -> list[dict]:
             break
     return items
 
-# ===== Parquet helpers (fallback store, if you ever want it) =====
+# ===== Parquet helpers =====
 @st.cache_data(ttl=300)
 def load_parquet_from_drive(name: str) -> pd.DataFrame:
     service = _get_drive_service()
-    folder_id = DRIVE_FOLDER_ID or None
+    folder_id = _current_drive_folder_id() or None
     file_id = _drive_find_file_id(service, name, folder_id)
     if not file_id:
         return pd.DataFrame()
@@ -148,7 +279,7 @@ def load_parquet_from_drive(name: str) -> pd.DataFrame:
 
 def save_parquet_to_drive(name: str, df: pd.DataFrame):
     service = _get_drive_service()
-    folder_id = DRIVE_FOLDER_ID or None
+    folder_id = _current_drive_folder_id() or None
     file_id = _drive_find_file_id(service, name, folder_id)
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
@@ -159,14 +290,9 @@ def save_parquet_to_drive(name: str, df: pd.DataFrame):
 # DuckDB Load/Save (from/to Drive)
 # =========================
 def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Download DuckDB file to a temp path; return (local_path, file_id, error).
-    Prefers DUCKDB_FILE_ID. Otherwise searches by name in DRIVE_FOLDER_ID (or all drives visible).
-    """
     try:
         service = _get_drive_service()
 
-        # Prefer explicit file ID if present (bypasses all name/folder/shortcut issues)
         if DUCKDB_FILE_ID:
             try:
                 f = _drive_get_file_by_id(service, DUCKDB_FILE_ID)
@@ -178,10 +304,9 @@ def _download_duckdb_rw(name: str) -> Tuple[Optional[str], Optional[str], Option
             except Exception as e:
                 return None, None, f"DUCKDB_FILE_ID lookup failed: {e}"
 
-        # Else search by name (optionally within folder)
-        file_id = _drive_find_file_id(service, name, DRIVE_FOLDER_ID or None)
+        file_id = _drive_find_file_id(service, name, _current_drive_folder_id() or None)
         if not file_id:
-            where = DRIVE_FOLDER_ID or "all drives visible to the service account"
+            where = _current_drive_folder_id() or "all drives visible to the service account"
             return None, None, f"File '{name}' not found in {where}."
         raw = _drive_download_bytes(service, file_id)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
@@ -194,20 +319,17 @@ def _upload_duckdb_back(local_path: str, file_id: str, name: str):
     service = _get_drive_service()
     with open(local_path, "rb") as f:
         data = f.read()
-    _drive_upload_bytes(service, name, data, "application/octet-stream", DRIVE_FOLDER_ID or None, file_id)
+    _drive_upload_bytes(service, name, data, "application/octet-stream", _current_drive_folder_id() or None, file_id)
 
 @st.cache_data(ttl=300)
 def load_from_duckdb(db_name: str, _schema_version: int = 2) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
-    """
-    Read DuckDB tables into DataFrames. Returns (records, roster_long, diagnostics)
-    """
     diags = {
         "db_file": db_name,
         "found": "no",
         "records_rows": "0",
         "roster_rows": "0",
         "note": "",
-        "folder_id": DRIVE_FOLDER_ID or "(empty)",
+        "folder_id": _current_drive_folder_id() or "(empty)",
         "file_id": DUCKDB_FILE_ID or "(not set)",
         "sa_email": SA_INFO.get("client_email", "<unknown>"),
     }
@@ -225,9 +347,7 @@ def load_from_duckdb(db_name: str, _schema_version: int = 2) -> Tuple[pd.DataFra
 
     # records
     try:
-        df_records = con.execute("""
-            SELECT Center, Language, Shift, Metric, Date, Value FROM records
-        """).df()
+        df_records = con.execute("""SELECT Center, Language, Shift, Metric, Date, Value FROM records""").df()
     except Exception:
         try:
             df_records = con.execute("SELECT Center, Language, Shift, Date, Value FROM records").df()
@@ -237,87 +357,42 @@ def load_from_duckdb(db_name: str, _schema_version: int = 2) -> Tuple[pd.DataFra
             df_records = pd.DataFrame()
             diags["note"] += f" | records read error: {e}"
 
-    # roster_long
-    # roster_long  (schema-tolerant loader)
+    # roster_long (schema-tolerant)
     try:
-        # Discover real schema
         info = con.execute("PRAGMA table_info('roster_long')").df()
         if info.empty:
             raise Exception("table 'roster_long' not found or has no columns")
-
-        # case-insensitive name lookup
         name_map = {str(n).strip().lower(): str(n).strip() for n in info["name"].astype(str)}
-
-        def has(col):
-            return col.lower() in name_map
-
-        def col(col):
-            return name_map.get(col.lower(), col)
-
+        def has(col): return col.lower() in name_map
+        def col(col): return name_map.get(col.lower(), col)
         select_bits = []
-
         def add_varchar(target_name, source_name=None):
-            """
-            Add a VARCHAR column either from existing source, or NULL if missing.
-            """
             if source_name and has(source_name):
                 select_bits.append(f"{col(source_name)} AS {target_name}")
             elif has(target_name):
                 select_bits.append(f"{col(target_name)}")
             else:
                 select_bits.append(f"CAST(NULL AS VARCHAR) AS {target_name}")
-
-        # static/meta columns (fill if missing)
-        add_varchar("AgentID")
-        add_varchar("EmpID")
-        add_varchar("AgentName")
-        add_varchar("TLName")
-        add_varchar("Status")
-        # WorkMode: sometimes stored as Reason in legacy dumps — pick whichever exists
-        if has("WorkMode"):
-            add_varchar("WorkMode", "WorkMode")
-        elif has("Reason"):
-            add_varchar("WorkMode", "Reason")
-        else:
-            add_varchar("WorkMode")
-
-        add_varchar("Center")
-        add_varchar("Location")
-        add_varchar("Language")
-        add_varchar("SecondaryLanguage")
-        add_varchar("LOB")
-        add_varchar("FTPT")
+        add_varchar("AgentID"); add_varchar("EmpID"); add_varchar("AgentName"); add_varchar("TLName")
+        add_varchar("Status"); add_varchar("WorkMode" if has("WorkMode") else "Reason")  # WorkMode/Reason
+        add_varchar("Center"); add_varchar("Location")
+        add_varchar("Language"); add_varchar("SecondaryLanguage"); add_varchar("LOB"); add_varchar("FTPT")
         add_varchar("BaseShift")
-
-        # Date
-        if has("Date"):
-            select_bits.append(f"{col('Date')}")
-        else:
-            select_bits.append("CAST(NULL AS DATE) AS Date")
-
-        # Shift (fallback: Reason -> Shift if Shift missing)
-        if has("Shift"):
-            select_bits.append(f"{col('Shift')}")
-        elif has("Reason"):
-            select_bits.append(f"{col('Reason')} AS Shift")
-        else:
-            select_bits.append("CAST(NULL AS VARCHAR) AS Shift")
-
+        select_bits.append(f"{col('Date')}" if has("Date") else "CAST(NULL AS DATE) AS Date")
+        if has("Shift"): select_bits.append(f"{col('Shift')}")
+        elif has("Reason"): select_bits.append(f"{col('Reason')} AS Shift")
+        else: select_bits.append("CAST(NULL AS VARCHAR) AS Shift")
         sql = "SELECT " + ", ".join(select_bits) + " FROM roster_long"
         df_roster = con.execute(sql).df()
-
     except Exception as e:
         df_roster = pd.DataFrame()
         diags["note"] += f" | roster_long read error: {e}"
-    # --- FINISH: close + diagnostics + return ---
-    try:
-        con.close()
-    except Exception:
-        pass
+
+    try: con.close()
+    except Exception: pass
 
     diags["records_rows"] = str(0 if df_records is None or df_records.empty else len(df_records))
     diags["roster_rows"]  = str(0 if df_roster is None or df_roster.empty else len(df_roster))
-
     return df_records, df_roster, diags
 
 
@@ -382,6 +457,32 @@ def duckdb_replace_roster(local_db_path: str, file_id: str, name_in_drive: str, 
     _upload_duckdb_back(local_db_path, file_id, name_in_drive)
     load_from_duckdb.clear()
     return int(inserted)
+
+# ✨ NEW: Upsert for roster single edits (merge on AgentID+Date)
+def duckdb_upsert_roster(local_db_path: str, file_id: str, name_in_drive: str, roster_rows: pd.DataFrame) -> int:
+    if roster_rows.empty: return 0
+    df = roster_rows.copy()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    con = duckdb.connect(local_db_path, read_only=False)
+    _ensure_duckdb_schema(con)
+    con.register("patch_df", df)
+    # Update known editable columns; expand as needed.
+    con.execute("""
+        MERGE INTO roster_long AS t
+        USING patch_df AS s
+        ON COALESCE(t.AgentID,'') = COALESCE(s.AgentID,'')
+           AND t.Date = s.Date
+        WHEN MATCHED THEN UPDATE SET
+            Shift = COALESCE(s.Shift, t.Shift),
+            WorkMode = COALESCE(s.WorkMode, t.WorkMode),
+            Status = COALESCE(s.Status, t.Status)
+        WHEN NOT MATCHED THEN INSERT SELECT * FROM s;
+    """)
+    n = con.execute("SELECT COUNT(*) FROM patch_df;").fetchone()[0]
+    con.close()
+    _upload_duckdb_back(local_db_path, file_id, name_in_drive)
+    load_from_duckdb.clear()
+    return int(n)
 
 # =========================
 # Parsing helpers (Requested workbook)
@@ -539,7 +640,6 @@ def _languages_union(records: pd.DataFrame, roster: pd.DataFrame, center: Option
 def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     diags = {}
     if DUCKDB_FILE_NAME:
-        # Cache-safe call: if a stale cached shape appears, clear and retry once
         try:
             records, roster, d = load_from_duckdb(DUCKDB_FILE_NAME, _schema_version=2)
         except Exception:
@@ -557,7 +657,7 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
                       "records_rows":str(0 if records.empty else len(records)),
                       "roster_rows": str(0 if roster.empty else len(roster)),
                       "found":"n/a","db_file":"n/a","note":"",
-                      "folder_id": DRIVE_FOLDER_ID or "(empty)",
+                      "folder_id": _current_drive_folder_id() or "(empty)",
                       "file_id": DUCKDB_FILE_ID or "(not set)",
                       "sa_email": SA_INFO.get("client_email","<unknown>")})
 
@@ -676,7 +776,7 @@ def pivot_requested(records, center, langs, start, end) -> pd.DataFrame:
     p = df.groupby(["Shift","Date"], as_index=False)["Value"].sum()
     p = p.pivot(index="Shift", columns="Date", values="Value").fillna(0.0)
     p = p.reindex(sorted(p.columns), axis=1)
-    p.index.name = "Shift"             # <-- add this
+    p.index.name = "Shift"
     return p
 
 def roster_lobs(roster: pd.DataFrame, center: Optional[str], start: date, end: date) -> List[str]:
@@ -734,17 +834,9 @@ def pivot_roster_counts(roster: pd.DataFrame,
                         languages_: List[str],
                         start: date,
                         end: date) -> pd.DataFrame:
-    """
-    Desktop-equivalent counting:
-      - Accepts time-like shifts in many formats via _normalize_shift_label()
-      - Splits combined shifts (e.g., 0900-1300/1400-1800) and counts each part
-      - WO and CL are aggregated into a single 'WO+CL' row
-      - Returns a Shift x Date pivot of float counts
-    """
     if roster.empty or not languages_:
         return pd.DataFrame()
 
-    # Filter
     df = roster[roster["Date"].between(start, end)].copy()
     if center and center != "Overall":
         df = df[df["Center"] == center]
@@ -752,52 +844,37 @@ def pivot_roster_counts(roster: pd.DataFrame,
     if df.empty:
         return pd.DataFrame()
 
-    # Count rows: time-like vs WO/CL codes (normalize first)
     time_rows: list[tuple[date, str]] = []
     code_rows: list[tuple[date, str]] = []
 
     for _, row in df.iterrows():
         dt = row["Date"]
         raw = str(row.get("Shift", "")).strip()
-
-        # Normalize exactly like desktop
         norm = _normalize_shift_label(raw)
         if not norm:
-            # not a recognized time-like shift and not an off-code -> ignore
             continue
-
         if norm in {"WO", "CL", "WO+CL"}:
-            # treat both WO and CL and WO+CL as off-codes; they'll be combined below
-            # store original norm (WO or CL). 'WO+CL' also safe here.
             code_rows.append((dt, "WO" if norm == "WO" else ("CL" if norm == "CL" else "WO+CL")))
             continue
-
-        # norm is either a single '####-####' or a combined '####-####/####-####'
         parts = [p.strip() for p in str(norm).split("/") if p.strip()]
         for p in parts:
-            # defensive: keep only proper single parts
             if re.fullmatch(r"\d{4}-\d{4}", p):
                 time_rows.append((dt, p))
 
-    # Build pivot for time-like rows
     p = pd.DataFrame()
     if time_rows:
         tdf = pd.DataFrame(time_rows, columns=["Date", "Shift"])
         p = tdf.groupby(["Shift", "Date"]).size().unstack("Date", fill_value=0).astype(float)
-        # sort columns by date asc
         p = p.reindex(sorted(p.columns), axis=1)
 
-    # Build/off-codes as single 'WO+CL' row
     if code_rows:
         cdf = pd.DataFrame(code_rows, columns=["Date", "Code"])
-        # count WO and CL (and possible WO+CL) per date, then fold into a single WO+CL total
         codes = cdf.groupby(["Date", "Code"]).size().unstack("Code", fill_value=0)
         w = codes.get("WO", 0)
         c = codes.get("CL", 0)
         wc = codes.get("WO+CL", 0)
         wocl = (w + c + wc).astype(float)
 
-        # align with time pivot columns
         all_cols = sorted(set(p.columns) | set(wocl.index.tolist()))
         p = (pd.DataFrame(columns=all_cols) if p.empty else p.reindex(columns=all_cols, fill_value=0.0))
         p.loc["WO+CL"] = [float(wocl.get(col, 0.0)) for col in p.columns]
@@ -832,6 +909,9 @@ def roster_agents_wide(roster: pd.DataFrame, center: Optional[str], lob: Optiona
 # =========================
 # Export utilities
 # =========================
+def _safe_name(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', s)
+
 def export_excel(view_type: str, center: str, languages_sel: List[str], start: date, end: date,
                  records: pd.DataFrame, roster: pd.DataFrame) -> bytes:
     from openpyxl.utils import get_column_letter
@@ -875,6 +955,7 @@ def export_excel(view_type: str, center: str, languages_sel: List[str], start: d
                 max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
                 ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 36)
     return output.getvalue()
+
 # === Requested editor helpers (desktop-style) ===
 def _validate_shift_label_for_edit(s: str) -> Optional[str]:
     if pd.isna(s) or str(s).strip() == "":
@@ -896,24 +977,15 @@ def _pivot_requested_one_lang(records: pd.DataFrame, center: str, language: str,
     return p
 
 def _save_requested_edits(center: str, language: str, edited_df: pd.DataFrame, start: date, end: date) -> Tuple[int, str]:
-    """
-    Takes an edited 'Requested' grid (index=Shift, columns=Dates) and writes back to DuckDB/Parquet.
-    Returns (rows_upserted, message).
-    """
     if edited_df is None or edited_df.empty:
         return 0, "Nothing to save."
-
-    # Ensure date columns are real dates
     new_df = edited_df.copy()
     try:
         new_df.columns = [pd.to_datetime(c).date() for c in new_df.columns]
     except Exception:
         new_df = new_df[[c for c in new_df.columns if isinstance(c, (pd.Timestamp, date))]]
-
     if new_df.empty:
         return 0, "No valid date columns after validation."
-
-    # Normalize / validate shift labels
     new_df = new_df.reset_index().rename(columns={new_df.index.name or "index": "Shift"})
     new_df["ShiftNorm"] = new_df["Shift"].apply(_validate_shift_label_for_edit)
     new_df = new_df[~new_df["ShiftNorm"].isna()].copy()
@@ -921,7 +993,6 @@ def _save_requested_edits(center: str, language: str, edited_df: pd.DataFrame, s
         return 0, "All rows had invalid/empty shift labels."
     new_df = new_df.drop(columns=["Shift"]).rename(columns={"ShiftNorm": "Shift"}).set_index("Shift")
 
-    # melt to long
     out_long = new_df.reset_index().melt(id_vars="Shift", var_name="Date", value_name="Value")
     out_long = out_long.dropna(subset=["Value"])
     if out_long.empty:
@@ -937,7 +1008,6 @@ def _save_requested_edits(center: str, language: str, edited_df: pd.DataFrame, s
     out_long["Metric"] = "Requested"
     out_long = out_long[["Center","Language","Shift","Metric","Date","Value"]].copy()
 
-    # Write back
     if DUCKDB_FILE_NAME:
         local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
         if err or not local_db or not file_id:
@@ -965,13 +1035,18 @@ def _save_requested_edits(center: str, language: str, edited_df: pd.DataFrame, s
 # =========================
 # UI
 # =========================
-st.title("📊 Center Shiftwise Web Dashboard")
-st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet (Shared Drive compatible)")
+
+# ✨ NEW: Require sign-in & role
+user = require_auth()
+role = user.get("role", "viewer")
+is_admin = (role == "admin")
 
 # Load current store
 records, roster, diags = load_store()
 
+# ---------- Sidebar ----------
 with st.sidebar:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("🔐 Google Drive Setup")
     st.write("- Add service account JSON to **st.secrets['gcp_service_account']**."
              "\n- Set **st.secrets['DRIVE_FOLDER_ID']** to the Shared Drive folder that contains your DB."
@@ -979,6 +1054,16 @@ with st.sidebar:
     if st.button("↻ Sync from Drive", use_container_width=True):
         load_parquet_from_drive.clear()
         load_from_duckdb.clear()
+        st.rerun()
+
+    # ✨ NEW: Fetch by Folder ID (runtime)
+    st.divider()
+    st.subheader("📁 Fetch by Folder ID")
+    folder_id_in = st.text_input("Shared Drive Folder ID", value=_current_drive_folder_id())
+    if st.button("Use this Folder", use_container_width=True):
+        st.session_state.override_drive_folder_id = folder_id_in.strip() or None
+        load_parquet_from_drive.clear(); load_from_duckdb.clear()
+        st.success("Folder set. Reloading …")
         st.rerun()
 
     st.divider()
@@ -992,87 +1077,93 @@ with st.sidebar:
 
     st.divider()
     st.subheader("⬆️ Import Files (Excel)")
+    # Requested
     req_file = st.file_uploader("Requested workbook (.xlsx)", type=["xlsx"], key="req")
-    if st.button("Import Requested", type="primary", use_container_width=True, disabled=not req_file):
-        new_req = parse_workbook_to_df(req_file.read())
-        if new_req.empty:
-            st.warning("No Requested data parsed.")
+    if st.button("Import Requested", type="primary", use_container_width=True, disabled=(not req_file or not is_admin)):
+        if not is_admin:
+            st.error("You need admin role to import.")
         else:
-            if DUCKDB_FILE_NAME:
-                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                if err or not local_db or not file_id:
-                    st.error(f"DuckDB issue: {err or 'File not found.'}")
-                else:
-                    try:
-                        affected = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, new_req)
-                        st.success(f"Upserted Requested rows: {affected}")
-                    except Exception as e:
-                        st.error(f"DuckDB upsert failed: {e}")
+            new_req = parse_workbook_to_df(req_file.read())
+            if new_req.empty:
+                st.warning("No Requested data parsed.")
             else:
-                cur = load_parquet_from_drive(RECORDS_FILE)
-                if cur.empty:
-                    out = new_req
+                if DUCKDB_FILE_NAME:
+                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                    if err or not local_db or not file_id:
+                        st.error(f"DuckDB issue: {err or 'File not found.'}")
+                    else:
+                        try:
+                            affected = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, new_req)
+                            st.success(f"Upserted Requested rows: {affected}")
+                        except Exception as e:
+                            st.error(f"DuckDB upsert failed: {e}")
                 else:
-                    keys = ["Center","Language","Shift","Date"]
-                    left = cur.merge(new_req[keys].drop_duplicates(), on=keys, how="left", indicator=True)
-                    keep = left["_merge"] == "left_only"
-                    base = cur[keep].copy()
-                    out = pd.concat([base, new_req], ignore_index=True)
-                save_parquet_to_drive(RECORDS_FILE, out)
-                st.success(f"Imported Requested rows: {len(new_req)}")
+                    cur = load_parquet_from_drive(RECORDS_FILE)
+                    if cur.empty:
+                        out = new_req
+                    else:
+                        keys = ["Center","Language","Shift","Date"]
+                        left = cur.merge(new_req[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+                        keep = left["_merge"] == "left_only"
+                        base = cur[keep].copy()
+                        out = pd.concat([base, new_req], ignore_index=True)
+                    save_parquet_to_drive(RECORDS_FILE, out)
+                    st.success(f"Imported Requested rows: {len(new_req)}")
 
+    # Roster
     rost_file = st.file_uploader("Roster workbook (.xlsx)", type=["xlsx"], key="rost")
-    if st.button("Import Roster (replace)", use_container_width=True, disabled=not rost_file):
-        raw = read_roster_sheet(rost_file.read())
-        if raw.empty:
-            st.warning("No Roster data found (need a 'Roster' sheet).")
+    if st.button("Import Roster (replace)", use_container_width=True, disabled=(not rost_file or not is_admin)):
+        if not is_admin:
+            st.error("You need admin role to import.")
         else:
-            if DUCKDB_FILE_NAME:
-                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                if err or not local_db or not file_id:
-                    st.error(f"DuckDB issue: {err or 'File not found.'}")
-                else:
-                    try:
-                        if "Date" not in raw or "Shift" not in raw:
-                            st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
-                        else:
-                            raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                            inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw)
-                            st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
-                    except Exception as e:
-                        st.error(f"DuckDB roster replace failed: {e}")
+            raw = read_roster_sheet(rost_file.read())
+            if raw.empty:
+                st.warning("No Roster data found (need a 'Roster' sheet).")
             else:
-                save_parquet_to_drive(ROSTER_FILE, raw)
-                st.success(f"Roster imported to Parquet. Rows: {len(raw)}")
+                if DUCKDB_FILE_NAME:
+                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                    if err or not local_db or not file_id:
+                        st.error(f"DuckDB issue: {err or 'File not found.'}")
+                    else:
+                        try:
+                            if "Date" not in raw or "Shift" not in raw:
+                                st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
+                            else:
+                                raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
+                                inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw)
+                                st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
+                        except Exception as e:
+                            st.error(f"DuckDB roster replace failed: {e}")
+                else:
+                    save_parquet_to_drive(ROSTER_FILE, raw)
+                    st.success(f"Roster imported to Parquet. Rows: {len(raw)}")
 
-    st.divider()
+    st.markdown("</div>", unsafe_allow_html=True)
+
 # ========== Top filter row (union of centers/languages) ==========
-c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.3, 1.7])
-with c1:
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+top1, top2, top3, top4 = st.columns([1.5, 1.2, 1.3, 1.7])
+with top1:
     center_vals = _centers_union(records, roster)
     center = st.selectbox("Center", center_vals, index=0 if center_vals else None)
-with c2:
+with top2:
     ds = union_dates(records, roster, center)
     if ds: start_default, end_default = ds[0], ds[-1]
     else:  start_default = end_default = date.today()
     date_range = st.date_input("Date range", value=(start_default, end_default))
     start, end = (date_range if isinstance(date_range, tuple) else (start_default, end_default))
-with c3:
+with top3:
     view_type = st.selectbox("View", ["Shift_Wise Delta View","Interval_Wise Delta View","Overall_Delta View"], index=0)
-with c4:
+with top4:
     lang_choices = _languages_union(records, roster, center)
-    langs_sel = st.multiselect(
-        "Languages",
-        lang_choices,
-        default=(lang_choices if lang_choices else []),
-    )
+    langs_sel = st.multiselect("Languages", lang_choices, default=(lang_choices if lang_choices else []))
+st.markdown("</div>", unsafe_allow_html=True)
+
 # >>> EXPORT SIDEBAR (depends on center, view_type, start, end, langs_sel) <<<
 with st.sidebar:
-    st.divider()
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("📤 Export Current View")
-
-    exp_name = f"{center}_{view_type.replace(' ', '_')}_{start:%Y%m%d}_{end:%Y%m%d}.xlsx"
-
+    exp_name = _safe_name(f"{center}_{view_type.replace(' ', '_')}_{start:%Y%m%d}_{end:%Y%m%d}.xlsx")
     if st.button("Build Excel", type="primary", use_container_width=True):
         try:
             xlsx_bytes = export_excel(
@@ -1102,20 +1193,21 @@ with st.sidebar:
             if st.button("📤 Upload to Drive", use_container_width=True):
                 try:
                     service = _get_drive_service()
-                    file_id = _drive_find_file_id(service, exp_name, DRIVE_FOLDER_ID or None)
+                    file_id = _drive_find_file_id(service, exp_name, _current_drive_folder_id() or None)
                     up_id = _drive_upload_bytes(
                         service=service,
                         name=exp_name,
                         data=st.session_state["last_export_bytes"],
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        folder_id=DRIVE_FOLDER_ID or None,
+                        folder_id=_current_drive_folder_id() or None,
                         file_id=file_id,
                     )
                     st.success(f"Uploaded to Drive (file id: {up_id}).")
                 except Exception as e:
                     st.error(f"Drive upload failed: {e}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-st.divider()
+st.markdown("<div class='card'>", unsafe_allow_html=True)
 
 # Build data for views
 req_shift = dedup_requested_split_pairs(pivot_requested(records, center, langs_sel, start, end))
@@ -1127,7 +1219,6 @@ req_shift = req_shift.reindex(index=all_shifts, columns=all_dates, fill_value=0.
 ros_shift = ros_shift.reindex(index=all_shifts, columns=all_dates, fill_value=0.0)
 delt_shift = ros_shift - req_shift
 
-# 🔧 ensure downstream melt() sees a 'Shift' column after reset_index()
 for _df in (req_shift, ros_shift, delt_shift):
     _df.index.name = "Shift"
 
@@ -1135,34 +1226,47 @@ req_shift_total = add_total_row(req_shift)
 ros_shift_total = add_total_row(ros_shift)
 delt_shift_total = add_total_row(delt_shift)
 
-
-# KPI row
+# KPI row (in soft cards)
 k1, k2, k3 = st.columns(3)
-with k1: st.metric("Requested", _pretty_int(req_shift.values.sum()))
-with k2: st.metric("Rostered", _pretty_int(ros_shift.values.sum()))
-with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
+with k1:
+    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+    st.metric("Requested", _pretty_int(req_shift.values.sum()))
+    st.markdown("</div>", unsafe_allow_html=True)
+with k2:
+    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+    st.metric("Rostered", _pretty_int(ros_shift.values.sum()))
+    st.markdown("</div>", unsafe_allow_html=True)
+with k3:
+    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+    st.metric("Delta", _pretty_int(delt_shift.values.sum()))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
 # PERSISTENT TABS + FULL RENDERERS
 # =========================
 
-# --- Renderers keep code organized and stop Streamlit from jumping tabs ---
 def render_dashboard(view_type: str,
                      req_shift: pd.DataFrame, ros_shift: pd.DataFrame, delt_shift: pd.DataFrame,
                      req_shift_total: pd.DataFrame, ros_shift_total: pd.DataFrame, delt_shift_total: pd.DataFrame):
+    st.subheader("📈 Dashboard")
     sub1, sub2, sub3 = st.columns(3)
     with sub1:
-        st.subheader("Requested – Shift-wise")
+        st.markdown("<div class='card'><h4>Requested – Shift-wise</h4>", unsafe_allow_html=True)
         st.dataframe(req_shift_total, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     with sub2:
-        st.subheader("Rostered – Shift-wise")
+        st.markdown("<div class='card'><h4>Rostered – Shift-wise</h4>", unsafe_allow_html=True)
         st.dataframe(ros_shift_total, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     with sub3:
-        st.subheader("Delta – Shift-wise")
+        st.markdown("<div class='card'><h4>Delta – Shift-wise</h4>", unsafe_allow_html=True)
         st.dataframe(delt_shift_total, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     if view_type in ["Interval_Wise Delta View", "Overall_Delta View"]:
-        st.markdown("---")
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Interval views")
         ci1, ci2, ci3 = st.columns(3)
         req_interval = transform_to_interval_view(req_shift)
@@ -1180,7 +1284,7 @@ def render_dashboard(view_type: str,
         with ci3:
             st.caption("Delta – Interval-wise")
             st.dataframe(add_total_row(delt_interval), use_container_width=True)
-
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # ==== Adapter so the new Plotter can read/write from your current data ====
 class DBAdapter:
@@ -1196,13 +1300,12 @@ class DBAdapter:
         return _languages_union(self.records, self.roster, center)
 
     def pivot_requested(self, center, langs, start, end):
-        # reuse your existing helper
         return pivot_requested(self.records, center, langs, start, end)
 
     def upsert_requested_cells(self, center, language, edits: dict):
-        """
-        edits: {(shift_label: str, date: datetime.date): value(float)}
-        """
+        if not is_admin:
+            st.error("You need admin role to save edits.")
+            return 0
         if not edits:
             return 0
         rows = []
@@ -1224,7 +1327,6 @@ class DBAdapter:
                 return 0
             return duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, df)
         else:
-            # Parquet fallback (merge-on-keys then append)
             cur = load_parquet_from_drive(RECORDS_FILE)
             if cur.empty:
                 save_parquet_to_drive(RECORDS_FILE, df)
@@ -1236,15 +1338,14 @@ class DBAdapter:
             new_all = pd.concat([base, df], ignore_index=True)
             save_parquet_to_drive(RECORDS_FILE, new_all)
             return len(df)
+
 # =========================
 # PLOTTER (Desktop-like) — FULL REPLACEMENT
 # =========================
 import re
-import pandas as pd
-from datetime import date
+from datetime import date as _date
 
-# session state for plotter
-if "plot_grid" not in st.session_state:     st.session_state.plot_grid = None   # DataFrame with columns: ["Shift", ...dates...]
+if "plot_grid" not in st.session_state:     st.session_state.plot_grid = None
 if "plot_center" not in st.session_state:   st.session_state.plot_center = None
 if "plot_lang" not in st.session_state:     st.session_state.plot_lang = None
 if "plot_range" not in st.session_state:    st.session_state.plot_range = (None, None)
@@ -1252,14 +1353,13 @@ if "plot_dirty" not in st.session_state:    st.session_state.plot_dirty = False
 
 _TIME_LIKE = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
 
-def _parse_ddmm_header_to_date(lbl: str, fallback_year: int) -> date | None:
+def _parse_ddmm_header_to_date(lbl: str, fallback_year: int) -> _date | None:
     s = str(lbl).strip()
     for fmt in ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d"):
         try:
             return pd.to_datetime(s, format=fmt).date()
         except Exception:
             pass
-    # try with fallback year (when header is "05-Oct")
     try:
         return pd.to_datetime(f"{s}-{fallback_year}", format="%d-%b-%Y").date()
     except Exception:
@@ -1275,7 +1375,6 @@ def _ensure_total_row(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _recalc_total(df: pd.DataFrame) -> pd.DataFrame:
-    """Sum all non-'Total' rows per date column."""
     if df is None or df.empty: return df
     body = df[~df["Shift"].astype(str).str.lower().eq("total")]
     sums = body.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=0)
@@ -1285,15 +1384,9 @@ def _recalc_total(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _grid_to_requested_df(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame:
-    """
-    grid_df: ["Shift", "05-Oct", "06-Oct", ...] with a 'Total' summary row.
-    returns Shift×Date numeric DF (dates are real date objects), without 'Total'.
-    """
     if grid_df is None or grid_df.empty: return pd.DataFrame()
     cols = list(grid_df.columns)
     if not cols or cols[0] != "Shift": return pd.DataFrame()
-
-    # map headers to real dates (skip those we cannot parse)
     parsed = []
     for h in cols[1:]:
         d = _parse_ddmm_header_to_date(h, from_year)
@@ -1301,14 +1394,12 @@ def _grid_to_requested_df(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame
     keep = [i+1 for i, d in enumerate(parsed) if d is not None]
     out_dates = [d for d in parsed if d is not None]
     if not keep: return pd.DataFrame()
-
     body = grid_df[~grid_df["Shift"].astype(str).str.lower().eq("total")].copy()
     body_rows = []
     idx_labels = []
     for _, r in body.iterrows():
         lbl = str(r["Shift"]).strip()
         if not lbl or not _TIME_LIKE.fullmatch(lbl):
-            # only time-like shifts saved to Requested (skip codes)
             continue
         vals = []
         for j in keep:
@@ -1318,28 +1409,20 @@ def _grid_to_requested_df(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame
                 v = 0.0
             vals.append(int(v) if float(v).is_integer() else float(v))
         body_rows.append(vals); idx_labels.append(lbl)
-
     if not body_rows: return pd.DataFrame()
     df = pd.DataFrame(body_rows, index=idx_labels, columns=out_dates)
     return df
 
-def _plotter_load_grid(db, centre: str, lang: str, d_start: date, d_end: date) -> pd.DataFrame:
-    """
-    Build the editable grid from DB Requested (Shift×Date + Total row).
-    Date headers are DD-MMM (no year), sorted chronologically.
-    """
-    req_df = db.pivot_requested(centre, [lang], d_start, d_end)
+def _plotter_load_grid(db, centre: str, lang: str, d_from: _date, d_to: _date) -> pd.DataFrame:
+    req_df = db.pivot_requested(centre, [lang], d_from, d_to)
     req_df = dedup_requested_split_pairs(req_df)
-    # Keep only dates within range
     keep_cols = []
     for c in req_df.columns:
         cd = c.date() if hasattr(c, "date") else c
-        if d_start <= cd <= d_end:
+        if d_from <= cd <= d_to:
             keep_cols.append(c)
     keep_cols = sorted(keep_cols)
     req_df = req_df.reindex(columns=keep_cols, fill_value=0.0)
-
-    # Build editable grid
     headers = ["Shift"] + [pd.to_datetime(c).strftime("%d-%b") for c in keep_cols]
     grid = []
     for shift_label in req_df.index:
@@ -1351,45 +1434,33 @@ def _plotter_load_grid(db, centre: str, lang: str, d_start: date, d_end: date) -
             except Exception:
                 row.append(0)
         grid.append(row)
-
     df = pd.DataFrame(grid, columns=headers)
     df = _ensure_total_row(df)
     df = _recalc_total(df)
     return df
 
 def _plotter_interval_from_grid(grid_df: pd.DataFrame, from_year: int) -> pd.DataFrame:
-    """Transform current grid into Interval×Date table (auto), including Total row."""
     req = _grid_to_requested_df(grid_df, from_year)
     if req.empty:
         return pd.DataFrame(columns=["Interval"])
     req.index.name = "Shift"
-    inter = transform_to_interval_view(req)  # uses your helper
+    inter = transform_to_interval_view(req)
     inter = inter.reindex(index=range(24), fill_value=0.0)
     inter = add_total_row(inter)
     inter.index.name = "Interval"
     return inter
 
 def render_plotter(db):
-    """
-    db: your DB adapter with:
-       - centers(include_overall=False) -> list[str]
-       - languages(center) -> list[str]
-       - pivot_requested(center, [lang], start, end) -> DF
-       - upsert_requested_cells(center, language, edits) -> None
-    """
     st.subheader("🧮 Plotter (desktop workflow)")
-
-    # ---- Controls row ----
+    if not is_admin:
+        st.info("You are in viewer mode. Editing is disabled.")
     c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1, 1, 1.6])
-
     with c1:
         centers = db.centers(include_overall=False) or []
         centre = st.selectbox("Center", centers, index=0 if centers else None, key="plot_center_sel")
     with c2:
         langs = db.languages(centre) if centre else []
         lang = st.selectbox("Language", langs, index=0 if langs else None, key="plot_lang_sel")
-
-    # derive default dates from DB span for the chosen center if available
     with c3:
         d_from = st.date_input("From", value=st.session_state.get("plot_from") or date.today(), key="plot_from")
     with c4:
@@ -1404,7 +1475,6 @@ def render_plotter(db):
         st.session_state.plot_range = (d_from, d_to)
         st.session_state.plot_dirty = False
 
-    # First load or when filters change
     if (st.session_state.plot_grid is None or
         st.session_state.plot_center != centre or
         st.session_state.plot_lang != lang or
@@ -1412,10 +1482,8 @@ def render_plotter(db):
         _reload_grid()
 
     with c5:
-        # toolbar buttons
         b1, b2, b3, b4 = st.columns([1,1,1,1.2])
         if b1.button("Add Date"):
-            # add any missing dates in [From..To]
             if st.session_state.plot_grid is not None and not st.session_state.plot_grid.empty:
                 headers = list(st.session_state.plot_grid.columns)
                 base_year = d_from.year
@@ -1426,12 +1494,10 @@ def render_plotter(db):
                 wanted = pd.date_range(d_from, d_to, freq="D").date
                 to_add = [d for d in wanted if d not in existing]
                 if to_add:
-                    new_headers = headers + [d.strftime("%d-%b") for d in to_add]
                     g = st.session_state.plot_grid.copy()
-                    for nh in new_headers:
+                    for nh in [d.strftime("%d-%b") for d in to_add]:
                         if nh not in g.columns:
                             g[nh] = 0
-                    # order date columns chronologically
                     head = ["Shift"]
                     pairs = []
                     for h in g.columns[1:]:
@@ -1448,13 +1514,9 @@ def render_plotter(db):
                     st.info("No new dates to add in the selected range.")
             else:
                 _reload_grid()
-
-        # fake placeholders for parity with desktop
         b2.button("Manage Shifts", help="(Open your shifts screen in web app)")
         b3.button("Manage Languages", help="(Open your languages screen in web app)")
-
-        # SAVE button
-        if b4.button("Save", type="primary", help="Write non-zero Requested cells to DB"):
+        if b4.button("Save", type="primary", help="Write non-zero Requested cells to DB", disabled=not is_admin):
             grid = st.session_state.plot_grid
             if grid is None or grid.empty or grid.shape[1] < 2:
                 st.warning("Nothing to save.")
@@ -1471,16 +1533,10 @@ def render_plotter(db):
                     st.session_state.plot_dirty = False
                 else:
                     st.info("No non-zero changes to save.")
-
-    st.markdown("---")
-
-    # ---- Shift-wise (editable) ----
     st.caption("Shift-wise Requested (editable)")
     if st.session_state.plot_grid is None:
         st.info("Select Center, Language and date range to load.")
         return
-
-    # Make first column read-only via column_config + disable editing of 'Total' row via on_change fix-up
     cfg = {"Shift": st.column_config.TextColumn("Shift", disabled=True)}
     edited = st.data_editor(
         st.session_state.plot_grid,
@@ -1488,25 +1544,20 @@ def render_plotter(db):
         use_container_width=True,
         column_config=cfg,
         key="plot_editor",
+        disabled=not is_admin
     )
-
-    # Keep Total row locked & recompute
     if not edited.empty:
-        # enforce Total row label
         if "Shift" in edited.columns:
             edited.loc[edited["Shift"].astype(str).str.lower() == "total", "Shift"] = "Total"
-        # zero out edits on Total (data columns)
         mask_total = edited["Shift"].astype(str).str.lower() == "total"
         if mask_total.any():
             cols = [c for c in edited.columns if c != "Shift"]
             edited.loc[mask_total, cols] = 0
         edited = _ensure_total_row(edited)
         edited = _recalc_total(edited)
-
     st.session_state.plot_grid = edited
     st.session_state.plot_dirty = True
 
-    # ---- Interval-wise (auto) ----
     inter = _plotter_interval_from_grid(edited, d_from.year)
     if inter.empty:
         st.info("No interval view for current grid.")
@@ -1521,16 +1572,132 @@ def render_plotter(db):
         unsafe_allow_html=True
     )
 
+# =========================
+# ✨ NEW: Roster Edit Dialogs (Single/Bulk)
+# =========================
+@st.dialog("Edit / Update Roster")
+def roster_edit_dialog(roster_df: pd.DataFrame):
+    if not is_admin:
+        st.error("You need admin role to edit roster.")
+        return
+    choice = st.radio("Mode", ["Single Edit", "Bulk Edit"], horizontal=True)
+    st.markdown("---")
 
+    if choice == "Single Edit":
+        agent_id = st.text_input("Genesys Agent ID")
+        # Date range limiter: max 7 days
+        today = date.today()
+        d_from = st.date_input("From date", value=today)
+        d_to = st.date_input("To date", value=today)
+        if (d_to - d_from).days > 6:
+            st.warning("Maximum editable range is 7 days. Please reduce the range.")
+            return
+        if st.button("Load rows", use_container_width=True):
+            dfr = roster_df.copy()
+            if agent_id:
+                dfr = dfr[dfr["AgentID"].astype(str) == agent_id.strip()]
+            dfr = dfr[(dfr["Date"] >= d_from) & (dfr["Date"] <= d_to)]
+            if dfr.empty:
+                st.info("No rows found for the given Agent ID and date range.")
+                return
+            # Editable columns
+            editable_cols = [c for c in ["Shift","WorkMode","Status"] if c in dfr.columns]
+            show_cols = ["Date","AgentID"] + editable_cols + [c for c in dfr.columns if c not in ["Date","AgentID"] + editable_cols]
+            dfr = dfr[show_cols]
+            st.caption("Edit desired fields below, then click Save.")
+            edited = st.data_editor(dfr, num_rows="fixed", use_container_width=True)
+            if st.button("Save changes", type="primary", use_container_width=True):
+                # Build patch rows: only keep changed rows & editable fields
+                diffs = []
+                for idx in range(len(dfr)):
+                    before = dfr.iloc[idx]
+                    after = edited.iloc[idx]
+                    changed = {}
+                    for col in editable_cols:
+                        if str(before[col]) != str(after[col]):
+                            changed[col] = after[col]
+                    if changed:
+                        changed["AgentID"] = after["AgentID"]
+                        changed["Date"] = after["Date"]
+                        diffs.append(changed)
+                if not diffs:
+                    st.info("No changes to save.")
+                    return
+                patch_df = pd.DataFrame(diffs)
+                if DUCKDB_FILE_NAME:
+                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                    if err or not local_db or not file_id:
+                        st.error(f"DuckDB issue: {err or 'File not found.'}")
+                        return
+                    n = duckdb_upsert_roster(local_db, file_id, DUCKDB_FILE_NAME, patch_df)
+                    st.success(f"Saved {n} roster updates.")
+                else:
+                    # Parquet fallback: load, update rows in-memory, write back
+                    base = load_parquet_from_drive(ROSTER_FILE)
+                    if base.empty:
+                        st.error("Roster store is empty; cannot patch.")
+                        return
+                    base = base.copy()
+                    base["Date"] = pd.to_datetime(base["Date"]).dt.date
+                    for _, r in patch_df.iterrows():
+                        m = (base["AgentID"].astype(str) == str(r["AgentID"])) & (base["Date"] == r["Date"])
+                        for col in editable_cols:
+                            if col in r and pd.notna(r[col]):
+                                base.loc[m, col] = r[col]
+                    save_parquet_to_drive(ROSTER_FILE, base)
+                    st.success(f"Saved {len(patch_df)} roster updates.")
+                # refresh
+                load_parquet_from_drive.clear(); load_from_duckdb.clear()
+                st.rerun()
 
-def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
+    else:  # Bulk Edit
+        st.info("Upload a roster file for bulk update. (Validation rules to be added later.)")
+        up = st.file_uploader("Upload roster (.xlsx)", type=["xlsx"], key="bulk_roster_up")
+        if st.button("Validate & Stage", use_container_width=True, disabled=(not up)):
+            # NOTE: Placeholder: accept & preview. We'll add validations when you share criteria.
+            raw = read_roster_sheet(up.read())
+            if raw.empty:
+                st.error("No 'Roster' sheet found or no data.")
+                return
+            st.success(f"Loaded {len(raw)} rows. Validation pending (to be implemented).")
+            st.dataframe(raw.head(50), use_container_width=True, height=300)
+            st.caption("✅ This is only staged. Final write will be enabled after we add your validation rules.")
+        st.caption("After validations are defined, we'll enable a 'Commit' button here.")
+
+# ------- Persistent tab switcher -------
+db = DBAdapter(records, roster)
+
+tab_choice = st.radio(
+    "View",
+    ["Dashboard", "Plotter", "Roster"],
+    horizontal=True,
+    key="active_tab"
+)
+
+if tab_choice == "Dashboard":
+    render_dashboard(
+        view_type,
+        req_shift, ros_shift, delt_shift,
+        req_shift_total, ros_shift_total, delt_shift_total
+    )
+
+elif tab_choice == "Plotter":
+    render_plotter(db)
+
+else:
+    # ✨ NEW: Roster with Date as first column (DD-MMM-YY)
+    def _fmt_date(d):
+        try:
+            return pd.to_datetime(d).strftime("%d-%b-%y")
+        except Exception:
+            return d
+
+    st.subheader("👥 Roster")
     # When Language changes, mark UI as busy
     def _roster_set_busy():
         st.session_state.busy_roster = True
 
     disabled = st.session_state.busy_roster
-
-    # --- Controls (disabled while busy) ---
     r1, r2, r3, r4, r5 = st.columns([1,1,1,1.3,1.2])
     with r1:
         lobs = roster_lobs(roster, center, start, end)
@@ -1544,20 +1711,15 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
     with r3:
         codes = roster_nonshift_codes(roster, center, start, end, lob, rlang)
         nonshift_sel = st.selectbox("Non-Shift", ["(All)"] + codes, disabled=disabled)
-
     with r4:
         shifts_list = roster_distinct_shifts(roster, center, start, end, lob, rlang)
-        # If a Non-Shift is chosen, visually disable Shift (your filter logic already prioritizes Non-Shift)
         shift_disabled = disabled or (nonshift_sel not in ("", "(All)"))
         shift_sel = st.selectbox("Shift", ["(All)"] + shifts_list, disabled=shift_disabled)
-
     with r5:
         ids_text = st.text_input("Genesys IDs (comma/space)", disabled=disabled)
         ids = [x.strip() for x in re.findall(r"[A-Za-z0-9_]+", ids_text)] if ids_text else None
 
-    # --- Build long (default) or wide table under spinner ---
     with st.spinner("Loading roster…"):
-        # Long data frame first
         dfr = roster[roster["Date"].between(start, end)].copy()
         if center and center != "Overall":
             dfr = dfr[dfr["Center"] == center]
@@ -1568,11 +1730,9 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
         if ids:
             dfr = dfr[dfr["AgentID"].isin(ids)]
 
-        # Normalize shift for robust filtering (desktop-equivalent)
         if not dfr.empty and "Shift" in dfr.columns:
             dfr["Shift"] = dfr["Shift"].apply(lambda s: (_normalize_shift_label(s) or str(s).strip().upper()))
 
-        # Apply Non-Shift / Shift filters on long data
         if not dfr.empty:
             time_like = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
             single_pat = re.compile(r"^\d{4}-\d{4}$")
@@ -1595,39 +1755,31 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
                     return False
                 dfr = dfr[dfr["Shift"].apply(keep_shift)]
 
-        # Columns for long display
-        static_cols = [c for c in [
-            "AgentID","AgentName","TLName","Status","WorkMode","Center","Location",
-            "Language","SecondaryLanguage","LOB","FTPT"
-        ] if c in dfr.columns]
-        long_cols = static_cols + ["Date", "Shift"]
-        long_df = dfr[long_cols] if not dfr.empty else pd.DataFrame(columns=long_cols)
+        # Reorder with Date first, formatted, then other columns
+        if dfr.empty:
+            long_df = pd.DataFrame(columns=["Date","AgentID","AgentName","TLName","Status","WorkMode","Center","Location","Language","SecondaryLanguage","LOB","FTPT","Shift"])
+        else:
+            dfr = dfr.copy()
+            dfr["Date_str"] = dfr["Date"].apply(_fmt_date)
+            static_cols = [c for c in [
+                "AgentID","AgentName","TLName","Status","WorkMode","Center","Location",
+                "Language","SecondaryLanguage","LOB","FTPT"
+            ] if c in dfr.columns]
+            long_cols = ["Date_str"] + static_cols + ["Shift"]
+            long_df = dfr[long_cols].rename(columns={"Date_str":"Date"})
 
-        # Default = LONG
-        st.caption("Roster (long format)")
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.caption("Roster (Date-first, DD-MMM-YY)")
         st.dataframe(long_df, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # Unlock controls after load
     st.session_state.busy_roster = False
 
-
-# ------- Persistent tab switcher (no auto-jump on rerun) -------
-db = DBAdapter(records, roster)
-
-tab_choice = st.radio(
-    "View",
-    ["Dashboard", "Plotter", "Roster"],
-    horizontal=True,
-    key="active_tab"
-)
-
-if tab_choice == "Dashboard":
-    render_dashboard(
-        view_type,
-        req_shift, ros_shift, delt_shift,
-        req_shift_total, ros_shift_total, delt_shift_total
-    )
-elif tab_choice == "Plotter":
-    render_plotter(db)
-else:
-    render_roster(roster, center, start, end)
+    # ✨ NEW: Edit/Update button (opens modal with Single/Bulk)
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("Edit / Update")
+    st.caption("Single edit supports Agent ID + date range (max 7 days). Bulk edit supports file upload (validation TBD).")
+    st.button("Edit / Update Roster", on_click=lambda: roster_edit_dialog(roster), type="primary", disabled=not is_admin)
+    if not is_admin:
+        st.info("You are in viewer mode; contact an admin for edit access.")
+    st.markdown("</div>", unsafe_allow_html=True)
