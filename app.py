@@ -140,74 +140,92 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
     return None
 
 def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
+    """
+    Render a Google SSO login button and, on success, return a user dict:
+      {"name": str, "email": str, "role": "admin" | "viewer", "auth": "sso"}
+    Uses positional args for OAuth2Component to support builds that don't accept kwargs.
+    """
     st.markdown("### 🔓 Login with Google (SSO)")
 
-    # Required fields
-    client_id = google_cfg.get("client_id")
-    client_secret = google_cfg.get("client_secret")
-    authorize_url = google_cfg.get("authorize_url")
-    token_url = google_cfg.get("token_url")
-    user_info_url = google_cfg.get("user_info_url")
-
-    # Some configs name it redirect_url, some redirect_uri — accept both
-    redirect_uri = (
-        google_cfg.get("redirect_uri")
-        or google_cfg.get("redirect_url")
-    )
+    # Required fields from secrets
+    client_id       = google_cfg.get("client_id")
+    client_secret   = google_cfg.get("client_secret")
+    authorize_url   = google_cfg.get("authorize_url")
+    token_url       = google_cfg.get("token_url")
+    user_info_url   = google_cfg.get("user_info_url")
+    redirect_uri    = google_cfg.get("redirect_uri") or google_cfg.get("redirect_url")
 
     required = [client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri]
     if not all(required):
         st.error(
-            "SSO is not fully configured. Please set these in `secrets` under `[oauth.google]`:\n"
+            "SSO is not fully configured. Please set these in `st.secrets['oauth']['google']`:\n"
             "client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri"
         )
         return None
 
-    # Build component
-    oauth2 = OAuth2Component(
-        client_id=client_id,
-        client_secret=client_secret,
-        authorize_url=authorize_url,
-        token_url=token_url,
-        refresh_token_url=token_url,
-        redirect_url=redirect_uri,   # keep this too; some builds use it
-    )
-
-    # ---- IMPORTANT: your wheel expects positional (name, redirect_uri, scope) ----
+    # Instantiate OAuth2Component **positionally** (some wheels don't accept kwargs)
     try:
-        result = oauth2.authorize_button(
-            "Sign in with Google",            # name
-            redirect_uri,                     # <-- REQUIRED positional arg
-            "openid email profile",           # scope
-            key="google_oauth_btn",
-            use_container_width=True,
-            extras_params={"prompt": "consent", "access_type": "offline", "response_type": "code"},
+        # Signature (varies by build) most commonly:
+        # OAuth2Component(client_id, client_secret, authorize_url, token_url, refresh_token_url, redirect_uri)
+        oauth2 = OAuth2Component(
+            client_id,
+            client_secret,
+            authorize_url,
+            token_url,     # access token URL
+            token_url,     # refresh token URL (Google uses same)
+            redirect_uri,  # redirect/callback URI
         )
     except TypeError as e:
-        st.error(f"authorize_button() failed: {e}\n"
-                 "Check that `redirect_uri` is provided and matches the Authorized redirect URI in Google Cloud.")
+        st.error(
+            f"OAuth2Component init failed: {e}\n"
+            "This build expects positional arguments. "
+            "We tried (client_id, client_secret, authorize_url, token_url, refresh_token_url, redirect_uri)."
+        )
         return None
 
+    # Render the button (also using positional args where required by some builds)
+    try:
+        result = oauth2.authorize_button(
+            "Sign in with Google",          # button label / name
+            redirect_uri,                   # REQUIRED positional arg for some builds
+            "openid email profile",         # scope
+            key="google_oauth_btn",
+            use_container_width=True,
+            extras_params={
+                "prompt": "consent",
+                "access_type": "offline",
+                "response_type": "code",
+            },
+        )
+    except TypeError as e:
+        st.error(
+            f"authorize_button() failed: {e}\n"
+            "Check that `redirect_uri` is provided and matches the Authorized redirect URI in Google Cloud."
+        )
+        return None
+
+    # No click yet
     if not result:
         return None
 
-    # Exchange the token & read profile
+    # Exchange token and fetch profile
     try:
-        token = result.get("token", {})
+        token = result.get("token", {}) if isinstance(result, dict) else {}
         access_token = token.get("access_token")
         if not access_token:
             st.error("SSO token missing from provider response.")
             return None
 
-        userinfo = oauth2.get_user_info(access_token=access_token, user_info_url=user_info_url)
+        userinfo = oauth2.get_user_info(access_token=access_token, user_info_url=user_info_url) or {}
         email = (userinfo.get("email") or "").lower().strip()
-        name = userinfo.get("name") or email or "User"
+        name = (userinfo.get("name") or email or "User").strip()
         if not email:
             st.error("Google did not return an email address.")
             return None
 
         role = _role_from_sso_email(email, admin_domains, viewer_domains)
         return {"name": name, "email": email, "role": role, "auth": "sso"}
+
     except Exception as e:
         st.error(f"SSO error: {e}")
         return None
