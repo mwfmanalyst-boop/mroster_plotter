@@ -1,9 +1,7 @@
 # app.py
 # =========================================================
 # Requirements in your environment:
-#   pip install streamlit duckdb google-api-python-client google-auth
-#   pip install google-auth-httplib2 google-auth-oauthlib pandas numpy openpyxl altair
-#   pip install bcrypt streamlit-oauth
+#   pip install -r requirements.txt
 #
 # REQUIRED secrets.toml sections (fill with real values):
 #
@@ -21,19 +19,22 @@
 # enable_password_login = true
 # enable_sso_login = true
 #
+# # NEW: for local (non-SSO) users, use salt + SHA256
 # [[auth.password_users]]
 # username = "fusion.user"
 # name = "Fusion User"
 # email = "fusion.agent@fusion.cx"
 # role = "admin"   # or "viewer"
-# password_hash = "<bcrypt-hash>"
+# password_salt = "9f7a2c90e4b9410e8b0b0ae2e0b1e7d3"
+# password_sha256 = "f74b0b1c7c3e0b88077b1c8d9a9c6a4f0b7a9b1f6d3e1c7a2f0e9c8d7a6b5c4"
 #
 # [[auth.password_users]]
 # username = "meesho.manager"
 # name = "Meesho Manager"
 # email = "ops@meesho.com"
 # role = "admin"
-# password_hash = "<bcrypt-hash>"
+# password_salt = "d2c1f0a9b7e6d5c4b3a2918070605040"
+# password_sha256 = "e0c6b3a9f71234e5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3"
 #
 # [auth.sso_roles]
 # admin_domains = ["meesho.com"]
@@ -68,9 +69,22 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 # DuckDB
 import duckdb
 
-# ===== Auth deps =====
-import bcrypt
+# ===== Auth deps (SSO) =====
 from streamlit_oauth import OAuth2Component
+
+# ===== Password (no-bcrypt) helpers =====
+import hashlib, hmac
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def verify_local_password(entered_password: str, salt_hex: str, stored_sha256_hex: str) -> bool:
+    """
+    Compares SHA-256(salt + entered_password) with stored_sha256_hex in constant time.
+    """
+    if not salt_hex or not stored_sha256_hex:
+        return False
+    calc = _sha256_hex(salt_hex + entered_password).lower()
+    return hmac.compare_digest(calc, stored_sha256_hex.lower())
 
 # =========================
 # Page + Global Config + CSS
@@ -136,12 +150,6 @@ def _get_auth_config():
         "google": google,
     }
 
-def _bcrypt_verify(pw_plain: str, pw_hash: str) -> bool:
-    try:
-        return bcrypt.checkpw(pw_plain.encode(), pw_hash.encode())
-    except Exception:
-        return False
-
 def _domain_of(email: str) -> str:
     return (email.split("@", 1)[-1] or "").lower().strip()
 
@@ -166,7 +174,12 @@ def _password_login_form(pusers: list[dict]) -> dict | None:
         return None
     for rec in pusers:
         if rec.get("username", "").strip().lower() == u.strip().lower():
-            if _bcrypt_verify(p, rec.get("password_hash","")):
+            ok = verify_local_password(
+                entered_password=p,
+                salt_hex=rec.get("password_salt", ""),
+                stored_sha256_hex=rec.get("password_sha256", ""),
+            )
+            if ok:
                 return {
                     "name": rec.get("name") or u,
                     "email": rec.get("email") or f"{u}@local",
@@ -1471,7 +1484,7 @@ class DBAdapter:
             return len(df)
 
 # =========================
-# PLOTTER (Desktop-like) — shortened (unchanged logic)
+# PLOTTER (Desktop-like)
 # =========================
 import re as _re_pl
 from datetime import date as _date_pl
