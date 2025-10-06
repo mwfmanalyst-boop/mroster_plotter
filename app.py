@@ -53,79 +53,59 @@ st.set_page_config(page_title="Center Shiftwise Web Dashboard", page_icon="📊"
 
 st.markdown("""
 <style>
-/* Font */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html, body, [class^="css"] { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji','Segoe UI Emoji','Segoe UI Symbol', 'Noto Color Emoji' !important; }
+html, body, [class^="css"] { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans' !important; }
 
-/* Page background: animated gradient */
+/* Animated gradient background */
 .stApp {
   background: linear-gradient(120deg, #0f172a, #1e293b, #0f172a);
   background-size: 400% 400%;
   animation: gradientMove 18s ease infinite;
   padding: 24px 18px 48px 18px;
 }
-@keyframes gradientMove {
-  0% {background-position:0% 50%}
-  50%{background-position:100% 50%}
-  100%{background-position:0% 50%}
-}
+@keyframes gradientMove { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
 
-/* Content container spacing */
+/* Content container */
 .block-container { padding-top: 0.75rem; max-width: 1400px; }
 
-/* Glass cards */
-.card, .css-1r6slb0, .css-12w0qpk, .stTabs [data-baseweb="tab-list"] {
+/* Glass card + tabs */
+.card, .stTabs [data-baseweb="tab-list"] {
   background: rgba(255,255,255,0.08) !important;
   border: 1px solid rgba(255,255,255,0.16) !important;
   border-radius: 16px !important;
   backdrop-filter: blur(8px);
 }
 
-/* Headings + text color for dark bg */
+/* Typography colors */
 h1, h2, h3, h4, h5, h6, .stMarkdown p, .stMarkdown li {
   color: #e5e7eb !important;
-}
-
-/* Metrics */
-[data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
-  color: #e5e7eb !important;
-}
-[data-testid="stMetric"] {
-  background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 16px;
-  padding: 12px 16px;
 }
 
 /* Buttons */
 .stButton>button {
   border-radius: 12px !important;
   border: 1px solid rgba(255,255,255,0.2) !important;
-  background: rgba(255,255,255,0.1) !important;
+  background: rgba(255,255,255,0.10) !important;
   transition: transform .06s ease, background .2s ease;
 }
 .stButton>button:hover { transform: translateY(-1px); }
 
-/* Tabs */
-.stTabs [role="tab"] {
-  color: #e5e7eb !important; font-weight: 600;
-  border-bottom: 2px solid transparent;
+/* Metrics */
+[data-testid="stMetric"] {
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 16px;
+  padding: 12px 16px;
 }
-.stTabs [role="tab"][aria-selected="true"] {
-  border-bottom: 2px solid rgba(255,255,255,0.5);
-}
+[data-testid="stMetricValue"], [data-testid="stMetricDelta"] { color: #e5e7eb !important; }
 
 /* Dataframes */
 [data-testid="stDataFrame"] div[role="grid"] {
   border-radius: 12px !important;
   border: 1px solid rgba(255,255,255,0.16) !important;
 }
-[data-testid="stDataFrame"] table thead th {
-  position: sticky; top: 0; backdrop-filter: blur(8px);
-}
-[data-testid="stDataFrame"] tbody tr:nth-child(odd) td {
-  background: rgba(255,255,255,0.03);
-}
+[data-testid="stDataFrame"] table thead th { position: sticky; top: 0; backdrop-filter: blur(8px); }
+[data-testid="stDataFrame"] tbody tr:nth-child(odd) td { background: rgba(255,255,255,0.03); }
 
 /* Sidebar */
 section[data-testid="stSidebar"] {
