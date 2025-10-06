@@ -53,139 +53,125 @@ st.set_page_config(page_title="Center Shiftwise Web Dashboard", page_icon="📊"
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
-
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html, body, [class^="css"] {
-    font-family: 'Inter', system-ui, Segoe UI, Roboto, Ubuntu, Helvetica Neue, Arial !important;
+    font-family: 'Inter', system-ui, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial, 'Noto Sans' !important;
 }
 
-/* Modern animated gradient background */
+/* Animated main gradient */
 .stApp {
-    background: linear-gradient(120deg, #2b1055 0%, #7597de 100%, #6e43bc 100%);
-    background-size: 300% 300%;
-    animation: gradientBG 12s ease infinite;
+    background: linear-gradient(115deg, #667eea 0%, #764ba2 52%, #ff7eb3 100%);
+    background-size: 320% 320%;
+    animation: gradientMove 13s ease infinite;
     min-height: 100vh;
-    padding: 32px 18px 54px 18px;
+    padding: 28px 16px 48px 16px;
 }
-@keyframes gradientBG {
-    0%,100% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
+@keyframes gradientMove {
+    0%,100% {background-position: 0% 50%;}
+    50% {background-position: 100% 50%;}
 }
 
-/* Main dashboard 'tiles' and metric cards */
-.card, [data-testid="stMetric"], .block-container, [data-testid="stDataFrame"] div[role="grid"] {
-    background: rgba(255, 255, 255, 0.14) !important;
-    border: 1.4px solid rgba(211, 198, 255, 0.21) !important;
+/* Modern tabs */
+.stTabs [data-baseweb="tab-list"] {
+    background: linear-gradient(90deg, #ff7eb3 0%, #48cae4 100%);
+    border-radius: 20px !important;
+    box-shadow: 0 4px 14px rgba(80,80,200,0.14);
+    padding: 8px 6px;
+    margin-bottom: 26px;
+}
+.stTabs [data-baseweb="tab"] {
+    color: #fff !important;
+    font-weight: 600;
+    border-radius: 14px !important;
+    margin: 0 2px !important;
+    background: rgba(255,255,255,0.11);
+    transition: background .16s, color .16s;
+}
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(90deg,#764ba2 0,#48cae4 100%) !important;
+    color: #fff !important;
+    box-shadow: 0 2px 12px rgba(80,80,200,0.12);
+}
+
+/* Floating cards and containers */
+.card, .block-container, .stTabs [data-baseweb="tab-list"], [data-testid="stMetric"], [data-testid="stDataFrame"] div[role="grid"], section[data-testid="stSidebar"], .stForm {
+    background: rgba(255,255,255,0.10) !important;
+    border: 1px solid rgba(255,255,255,0.21) !important;
     border-radius: 22px !important;
-    box-shadow: 0 10px 38px 0 rgba(62, 40, 139, 0.18), 0 1.5px 6px 0 #885bdc38 !important;
-    backdrop-filter: blur(13px) !important;
+    box-shadow: 0 10px 36px 0 rgba(31, 38, 135, 0.14) !important;
+    backdrop-filter: blur(17px) !important;
     margin-bottom: 24px;
     position: relative;
     z-index: 2;
-    transition: box-shadow .19s,background .13s;
-}
-.card:hover, [data-testid="stMetric"]:hover {
-    box-shadow: 0 22px 48px 0 rgba(62,40,139,0.22), 0 4px 16px #885bdc32;
-    background: rgba(255,255,255,0.21) !important;
 }
 
-/* Tile headers -- bold, gradient and shadow */
-.card h2, .card h4, .card h3, .card h1 {
-    font-weight: 700;
-    font-size: 1.29rem;
-    letter-spacing: 0.03em;
-    margin-top: 0;
-    color: #fff;
-    background: linear-gradient(97deg, #48cae4 0%, #ae61ff 55%, #ff61a6 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    text-shadow: 0 5px 22px #764ea149, 0 1px 0 #fff3;
-    padding-bottom: 5px;
+/* Emphasize headers */
+h1, h2, h3, h4, h5, h6, .stMarkdown p, .stMarkdown li {
+    color: #FFFFFF !important;
+    text-shadow: 1px 2px 16px rgba(0,0,0,0.22), 0 1px 4px #764ba24d;
 }
 
-/* Data tile tables for shift-wise view */
-[data-testid="stDataFrame"] div[role="grid"] {
-    border-radius: 14px !important;
-    border: 1.2px solid #ae61ff22 !important;
-    background: rgba(243, 239, 255, 0.12) !important;
-    box-shadow: 0 2.5px 13px #ae61ff1c, 0 2px 7px #48cae41c !important;
-}
-[data-testid="stDataFrame"] table thead th {
-    background: linear-gradient(90deg,#48cae4 .2,#ae61ff .8);
-    color: #fff;
-    font-weight: 600;
-    font-size: 1.07rem;
-    backdrop-filter: blur(5px);
-    border-bottom: 1.4px solid #ae61ff48;
-}
-[data-testid="stDataFrame"] tbody tr td {
-    background: rgba(120, 109, 255, 0.03) !important;
-    color: #23233f !important;
-    font-weight: 530;
-    font-size: 1.01rem;
-}
-[data-testid="stDataFrame"] tbody tr:nth-child(even) td {
-    background: rgba(160, 120, 250, 0.05) !important;
-}
-
-/* Metrics emphasized */
-[data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
-    color: #ae61ff !important;
-    font-size: 1.29rem;
-    font-weight: bold;
-    text-shadow: 0 2px 8px #ae61ffa0;
-}
-
-/* Large tile spacing on wide screens */
-.block-container {
-    max-width: 1460px;
-    margin-top: 20px !important;
-}
-
-/* Buttons, modern gradient */
+/* Buttons, modern gradients */
 .stButton>button {
-  border-radius: 19px !important;
-  border: none !important;
-  background: linear-gradient(94deg, #ae61ff 0%, #48cae4 100%);
-  color: #fff !important;
-  font-weight: 700 !important;
-  padding: 9px 38px !important;
-  box-shadow: 0 4px 24px #ae61ff2c;
-  transition: background 0.3s, transform 0.18s;
+    border-radius: 20px !important;
+    border: none !important;
+    background: linear-gradient(95deg, #ff7eb3 0%, #48cae4 100%);
+    color: #fff !important;
+    font-weight: 600 !important;
+    padding: 9px 36px !important;
+    box-shadow: 0 4px 22px rgba(188,143,255,0.19);
+    transition: background 0.3s, transform 0.18s;
 }
 .stButton>button:hover {
-  background: linear-gradient(94deg, #48cae4 0%, #ae61ff 100%);
-  transform: translateY(-1.5px) scale(1.04);
+    background: linear-gradient(95deg, #48cae4 0%, #764ba2 100%);
+    transform: translateY(-2px) scale(1.048);
 }
 
-/* Tile caption, metric undertext */
-.stMarkdown p, .card p, .stMetric p, .stCaption, .subheader {
-    color: #ecebff !important;
-    font-size: 1.02rem;
-    margin-bottom: 3px;
+/* Metrics & DataFrame tweaks */
+[data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
+    color: #e0e8ff !important;
 }
-h2, h3, h4, h5, h6 {
-    color: #fff !important;
-    margin-top: 0.6rem;
-    letter-spacing: 0.023em;
+[data-testid="stDataFrame"] table thead th {
+    backdrop-filter: blur(10px);
+    background: rgba(118,75,162,0.18);
+    color: #fff;
+}
+[data-testid="stDataFrame"] tbody tr:nth-child(odd) td {
+    background: rgba(118,75,162,0.10);
 }
 
-/* Sidebar update */
+/* Sidebar gradient glassmorphism */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(148deg, #ae61ff 0%, #48cae4 90%);
-    opacity: 0.94;
-    border-right: 1.25px solid #ae61ff44;
+    background: linear-gradient(135deg, #764ba2 0%, #48cae4 100%);
+    opacity: 0.95;
+    border-right: 1px solid rgba(255,255,255,0.16);
 }
 
-/* Inputs, dropdowns, selects */
-input, textarea, .stSelectbox>div>div {
-    background: rgba(255,255,255,0.21) !important;
-    border-radius: 11px !important;
-    color: #2b1055 !important;
+/* Input fields */
+input, textarea {
+    background: rgba(255,255,255,0.19) !important;
+    border-radius: 12px !important;
+    color: #232b5c !important;
     border: none !important;
-    font-weight: 520 !important;
-    box-shadow: 0 2px 7px #885bdc18;
+    font-weight: 500 !important;
+    box-shadow: 0 1px 10px #764ba226;
 }
+
+/* Card title bold */
+.card h4, .card h3, .card h2, .card h1 {
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #fff;
+    background: linear-gradient(90deg,#ff7eb3 0,#48cae4 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.block-container {
+    max-width: 1400px;
+    margin-top: 18px !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 # =========================
