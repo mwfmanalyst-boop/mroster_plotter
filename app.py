@@ -54,64 +54,124 @@ st.set_page_config(page_title="Center Shiftwise Web Dashboard", page_icon="📊"
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html, body, [class^="css"] { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans' !important; }
+html, body, [class^="css"] {
+    font-family: 'Inter', system-ui, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial, 'Noto Sans' !important;
+}
 
-/* Animated gradient background */
+/* Animated main gradient */
 .stApp {
-  background: linear-gradient(120deg, #0f172a, #1e293b, #0f172a);
-  background-size: 400% 400%;
-  animation: gradientMove 18s ease infinite;
-  padding: 24px 18px 48px 18px;
+    background: linear-gradient(115deg, #667eea 0%, #764ba2 52%, #ff7eb3 100%);
+    background-size: 320% 320%;
+    animation: gradientMove 13s ease infinite;
+    min-height: 100vh;
+    padding: 28px 16px 48px 16px;
 }
-@keyframes gradientMove { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
-
-/* Content container */
-.block-container { padding-top: 0.75rem; max-width: 1400px; }
-
-/* Glass card + tabs */
-.card, .stTabs [data-baseweb="tab-list"] {
-  background: rgba(255,255,255,0.08) !important;
-  border: 1px solid rgba(255,255,255,0.16) !important;
-  border-radius: 16px !important;
-  backdrop-filter: blur(8px);
+@keyframes gradientMove {
+    0%,100% {background-position: 0% 50%;}
+    50% {background-position: 100% 50%;}
 }
 
-/* Typography colors */
+/* Modern tabs */
+.stTabs [data-baseweb="tab-list"] {
+    background: linear-gradient(90deg, #ff7eb3 0%, #48cae4 100%);
+    border-radius: 20px !important;
+    box-shadow: 0 4px 14px rgba(80,80,200,0.14);
+    padding: 8px 6px;
+    margin-bottom: 26px;
+}
+.stTabs [data-baseweb="tab"] {
+    color: #fff !important;
+    font-weight: 600;
+    border-radius: 14px !important;
+    margin: 0 2px !important;
+    background: rgba(255,255,255,0.11);
+    transition: background .16s, color .16s;
+}
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(90deg,#764ba2 0,#48cae4 100%) !important;
+    color: #fff !important;
+    box-shadow: 0 2px 12px rgba(80,80,200,0.12);
+}
+
+/* Floating cards and containers */
+.card, .block-container, .stTabs [data-baseweb="tab-list"], [data-testid="stMetric"], [data-testid="stDataFrame"] div[role="grid"], section[data-testid="stSidebar"], .stForm {
+    background: rgba(255,255,255,0.10) !important;
+    border: 1px solid rgba(255,255,255,0.21) !important;
+    border-radius: 22px !important;
+    box-shadow: 0 10px 36px 0 rgba(31, 38, 135, 0.14) !important;
+    backdrop-filter: blur(17px) !important;
+    margin-bottom: 24px;
+    position: relative;
+    z-index: 2;
+}
+
+/* Emphasize headers */
 h1, h2, h3, h4, h5, h6, .stMarkdown p, .stMarkdown li {
-  color: #e5e7eb !important;
+    color: #FFFFFF !important;
+    text-shadow: 1px 2px 16px rgba(0,0,0,0.22), 0 1px 4px #764ba24d;
 }
 
-/* Buttons */
+/* Buttons, modern gradients */
 .stButton>button {
-  border-radius: 12px !important;
-  border: 1px solid rgba(255,255,255,0.2) !important;
-  background: rgba(255,255,255,0.10) !important;
-  transition: transform .06s ease, background .2s ease;
+    border-radius: 20px !important;
+    border: none !important;
+    background: linear-gradient(95deg, #ff7eb3 0%, #48cae4 100%);
+    color: #fff !important;
+    font-weight: 600 !important;
+    padding: 9px 36px !important;
+    box-shadow: 0 4px 22px rgba(188,143,255,0.19);
+    transition: background 0.3s, transform 0.18s;
 }
-.stButton>button:hover { transform: translateY(-1px); }
-
-/* Metrics */
-[data-testid="stMetric"] {
-  background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 16px;
-  padding: 12px 16px;
+.stButton>button:hover {
+    background: linear-gradient(95deg, #48cae4 0%, #764ba2 100%);
+    transform: translateY(-2px) scale(1.048);
 }
-[data-testid="stMetricValue"], [data-testid="stMetricDelta"] { color: #e5e7eb !important; }
 
-/* Dataframes */
-[data-testid="stDataFrame"] div[role="grid"] {
-  border-radius: 12px !important;
-  border: 1px solid rgba(255,255,255,0.16) !important;
+/* Metrics & DataFrame tweaks */
+[data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
+    color: #e0e8ff !important;
 }
-[data-testid="stDataFrame"] table thead th { position: sticky; top: 0; backdrop-filter: blur(8px); }
-[data-testid="stDataFrame"] tbody tr:nth-child(odd) td { background: rgba(255,255,255,0.03); }
+[data-testid="stDataFrame"] table thead th {
+    backdrop-filter: blur(10px);
+    background: rgba(118,75,162,0.18);
+    color: #fff;
+}
+[data-testid="stDataFrame"] tbody tr:nth-child(odd) td {
+    background: rgba(118,75,162,0.10);
+}
 
-/* Sidebar */
+/* Sidebar gradient glassmorphism */
 section[data-testid="stSidebar"] {
-  background: rgba(0,0,0,0.25);
-  border-right: 1px solid rgba(255,255,255,0.12);
+    background: linear-gradient(135deg, #764ba2 0%, #48cae4 100%);
+    opacity: 0.95;
+    border-right: 1px solid rgba(255,255,255,0.16);
 }
+
+/* Input fields */
+input, textarea {
+    background: rgba(255,255,255,0.19) !important;
+    border-radius: 12px !important;
+    color: #232b5c !important;
+    border: none !important;
+    font-weight: 500 !important;
+    box-shadow: 0 1px 10px #764ba226;
+}
+
+/* Card title bold */
+.card h4, .card h3, .card h2, .card h1 {
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #fff;
+    background: linear-gradient(90deg,#ff7eb3 0,#48cae4 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.block-container {
+    max-width: 1400px;
+    margin-top: 18px !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 # =========================
