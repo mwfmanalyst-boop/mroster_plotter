@@ -49,9 +49,16 @@ if "busy_roster" not in st.session_state:
 
 # Animated gradient background + card style
 # ===== Theme / Global Styles =====
-st.set_page_config(page_title="Center Shiftwise Web Dashboard", page_icon="📊", layout="wide")
-
 st.markdown("""
+/* App shell spacing */
+header, .block-container { scroll-behavior: smooth; }
+.block-container { padding-top: 8px !important; }
+
+/* Make the sidebar info group sticky-ish */
+section[data-testid="stSidebar"] .st-emotion-cache-1gulkj5 {
+    position: sticky; top: 12px;
+}
+
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html, body, [class^="css"] {
@@ -175,6 +182,65 @@ input, textarea {
 </style>
 """, unsafe_allow_html=True)
 # =========================
+# Full-screen Overlay Spinner helper
+# =========================
+from contextlib import contextmanager
+
+def _overlay_html(message: str) -> str:
+    return f"""
+    <style>
+    .__busy_overlay__ {{
+        position: fixed;
+        z-index: 99999;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(2px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }}
+    .__busy_card__ {{
+        background: rgba(255,255,255,0.10);
+        border: 1px solid rgba(255,255,255,0.25);
+        border-radius: 20px;
+        padding: 22px 26px;
+        color: #fff;
+        font-weight: 600;
+        box-shadow: 0 10px 36px rgba(31,38,135,0.25);
+    }}
+    .__busy_spinner__ {{
+        width: 28px; height: 28px; border-radius: 50%;
+        border: 3px solid rgba(255,255,255,0.35);
+        border-top-color: #fff;
+        animation: spin 0.8s linear infinite;
+        margin-right: 12px;
+    }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+    </style>
+    <div class="__busy_overlay__">
+      <div class="__busy_card__" style="display:flex;align-items:center;">
+        <div class="__busy_spinner__"></div>
+        <div>{message}</div>
+      </div>
+    </div>
+    """
+
+@contextmanager
+def overlay(message: str = "Processing…"):
+    """
+    Full-screen overlay that appears immediately during work in the with-block.
+    Usage:
+        with overlay("Loading data…"):
+            do_heavy_work()
+    """
+    placeholder = st.empty()
+    placeholder.markdown(_overlay_html(message), unsafe_allow_html=True)
+    try:
+        yield
+    finally:
+        placeholder.empty()
+
+# =========================
 # 🔐 Auth + RBAC + ACL
 # =========================
 def _get_auth_config():
@@ -250,11 +316,6 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
     user_info_url = (google_cfg.get("user_info_url") or "").strip()
     redirect_uri  = (google_cfg.get("redirect_uri") or google_cfg.get("redirect_url") or "").strip()
 
-    # >>> IMPORTANT: make redirect EXACTLY match what you registered in Google.
-    # If you registered it WITH a trailing slash, keep it. If WITHOUT, ensure no slash.
-    # Uncomment ONE of the following lines to force consistency if needed:
-    # redirect_uri = redirect_uri.rstrip("/")         # force NO trailing slash
-    # redirect_uri = redirect_uri.rstrip("/") + "/"   # force trailing slash
 
     if not all([client_id, client_secret, authorize_url, token_url, user_info_url, redirect_uri]):
         st.error(
@@ -385,6 +446,7 @@ def _render_auth_gate():
 
 ACL_FILE_NAME = st.secrets.get("ACL_FILE_NAME", "center_acl.json")
 
+@st.cache_resource
 def _get_drive_service():
     SA_INFO = st.secrets.get("gcp_service_account", {})
     if not SA_INFO:
@@ -452,6 +514,7 @@ def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: O
     file = service.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
     return file["id"]
 
+@st.cache_data(ttl=120, show_spinner=False)
 def _drive_list_folder(service, folder_id: str) -> list[dict]:
     items = []
     page_token = None
@@ -954,6 +1017,7 @@ def _minutes_of(label: str) -> Optional[int]:
     start = sh*60 + sm; end = eh*60 + em
     return (end - start) if end > start else None
 
+@st.cache_data(show_spinner=False, ttl=600)
 def dedup_requested_split_pairs(pivot_df: pd.DataFrame) -> pd.DataFrame:
     if pivot_df.empty: return pivot_df
     df = pivot_df.copy()
@@ -975,6 +1039,7 @@ def dedup_requested_split_pairs(pivot_df: pd.DataFrame) -> pd.DataFrame:
                 df.at[row_4h, col] = 0.0
     return df
 
+@st.cache_data(show_spinner=False, ttl=600)
 def transform_to_interval_view(shift_df: pd.DataFrame) -> pd.DataFrame:
     if shift_df.empty: return pd.DataFrame(index=range(24))
     cols_dates = [pd.to_datetime(c).date() for c in shift_df.columns]
@@ -1026,6 +1091,7 @@ def union_dates(records: pd.DataFrame, roster: pd.DataFrame, center: Optional[st
         rs |= set(roster["Date"].unique().tolist()) if center in (None, "", "Overall") else set(roster.loc[roster["Center"]==center, "Date"].unique().tolist())
     return sorted(list(rs))
 
+@st.cache_data(show_spinner=False, ttl=300)
 def pivot_requested(records, center, langs, start, end) -> pd.DataFrame:
     if records.empty or not langs: return pd.DataFrame()
     df = records[(records["Date"].between(start, end)) & (records["Language"].isin(langs))].copy()
@@ -1087,6 +1153,7 @@ def roster_nonshift_codes(roster: pd.DataFrame, center: Optional[str], start: da
             vals.append(t)
     return sorted(dict.fromkeys(vals), key=lambda x: x.upper())
 
+@st.cache_data(show_spinner=False, ttl=300)
 def pivot_roster_counts(roster: pd.DataFrame,
                         center: Optional[str],
                         languages_: List[str],
@@ -1280,7 +1347,10 @@ st.title("📊 Center Shiftwise Web Dashboard")
 st.caption("Google Drive-backed • Streamlit • DuckDB/Parquet (Shared Drive compatible)")
 
 # Load current store
-records, roster, diags = load_store()
+# Load current store (overlay for UX)
+with overlay("Loading data from Drive / DuckDB…"):
+    records, roster, diags = load_store()
+
 
 with st.sidebar:
     # Account + logout
@@ -1300,9 +1370,10 @@ with st.sidebar:
              "\n- Prefer setting **DUCKDB_FILE_ID** (faster sync)")
 
     if st.button("↻ Sync from Drive", use_container_width=True):
-        load_parquet_from_drive.clear()
-        load_from_duckdb.clear()
-        _load_acl_from_drive_cached.clear()
+        with overlay("Refreshing cached data…"):
+            load_parquet_from_drive.clear()
+            load_from_duckdb.clear()
+            _load_acl_from_drive_cached.clear()
         st.rerun()
 
     st.divider()
@@ -1345,30 +1416,31 @@ with st.sidebar:
 
     if st.button("Import Requested", type="primary", use_container_width=True, disabled=(req_file is None)):
         try:
-            raw_bytes = req_file.read() if hasattr(req_file, "read") else req_file
-            new_req = parse_workbook_to_df(raw_bytes)
-            if new_req.empty:
-                st.warning("No Requested data parsed.")
-            else:
-                if DUCKDB_FILE_NAME:
-                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                    if err or not local_db or not file_id:
-                        st.error(f"DuckDB issue: {err or 'File not found.'}")
-                    else:
-                        affected = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, new_req)
-                        st.success(f"Upserted Requested rows: {affected}")
+            with overlay("Parsing & upserting Requested…"):
+                raw_bytes = req_file.read() if hasattr(req_file, "read") else req_file
+                new_req = parse_workbook_to_df(raw_bytes)
+                if new_req.empty:
+                    st.warning("No Requested data parsed.")
                 else:
-                    cur = load_parquet_from_drive(RECORDS_FILE)
-                    if cur.empty:
-                        out = new_req
+                    if DUCKDB_FILE_NAME:
+                        local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                        if err or not local_db or not file_id:
+                            st.error(f"DuckDB issue: {err or 'File not found.'}")
+                        else:
+                            affected = duckdb_upsert_records(local_db, file_id, DUCKDB_FILE_NAME, new_req)
+                            st.success(f"Upserted Requested rows: {affected}")
                     else:
-                        keys = ["Center","Language","Shift","Date"]
-                        left = cur.merge(new_req[keys].drop_duplicates(), on=keys, how="left", indicator=True)
-                        keep = left["_merge"] == "left_only"
-                        base = cur[keep].copy()
-                        out = pd.concat([base, new_req], ignore_index=True)
-                    save_parquet_to_drive(RECORDS_FILE, out)
-                    st.success(f"Imported Requested rows: {len(new_req)}")
+                        cur = load_parquet_from_drive(RECORDS_FILE)
+                        if cur.empty:
+                            out = new_req
+                        else:
+                            keys = ["Center", "Language", "Shift", "Date"]
+                            left = cur.merge(new_req[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+                            keep = left["_merge"] == "left_only"
+                            base = cur[keep].copy()
+                            out = pd.concat([base, new_req], ignore_index=True)
+                        save_parquet_to_drive(RECORDS_FILE, out)
+                        st.success(f"Imported Requested rows: {len(new_req)}")
         except Exception as e:
             st.error(f"Import Requested failed: {e}")
 
@@ -1402,24 +1474,25 @@ with st.sidebar:
 
     if st.button("Import Roster (replace ALL)", use_container_width=True, disabled=(rost_file is None)):
         try:
-            raw_df = read_roster_sheet(rost_file.read() if hasattr(rost_file,"read") else rost_file)
-            if raw_df.empty:
-                st.warning("No Roster data found (need a 'Roster' sheet).")
-            else:
-                if DUCKDB_FILE_NAME:
-                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                    if err or not local_db or not file_id:
-                        st.error(f"DuckDB issue: {err or 'File not found.'}")
-                    else:
-                        if "Date" not in raw_df or "Shift" not in raw_df:
-                            st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
-                        else:
-                            raw_df["Date"] = pd.to_datetime(raw_df["Date"]).dt.date
-                            inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw_df)
-                            st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
+            with overlay("Importing roster & replacing table…"):
+                raw_df = read_roster_sheet(rost_file.read() if hasattr(rost_file, "read") else rost_file)
+                if raw_df.empty:
+                    st.warning("No Roster data found (need a 'Roster' sheet).")
                 else:
-                    save_parquet_to_drive(ROSTER_FILE, raw_df)
-                    st.success(f"Roster imported to Parquet. Rows: {len(raw_df)}")
+                    if DUCKDB_FILE_NAME:
+                        local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                        if err or not local_db or not file_id:
+                            st.error(f"DuckDB issue: {err or 'File not found.'}")
+                        else:
+                            if "Date" not in raw_df or "Shift" not in raw_df:
+                                st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
+                            else:
+                                raw_df["Date"] = pd.to_datetime(raw_df["Date"]).dt.date
+                                inserted = duckdb_replace_roster(local_db, file_id, DUCKDB_FILE_NAME, raw_df)
+                                st.success(f"Roster replaced in DuckDB. Rows inserted: {inserted}")
+                    else:
+                        save_parquet_to_drive(ROSTER_FILE, raw_df)
+                        st.success(f"Roster imported to Parquet. Rows: {len(raw_df)}")
         except Exception as e:
             st.error(f"Import Roster failed: {e}")
 
@@ -1727,12 +1800,13 @@ def render_plotter(db):
 
     def _reload_grid():
         if not centre or not lang: return
-        grid = _plotter_load_grid(db, centre, lang, d_from, d_to)
-        st.session_state.plot_grid = grid
-        st.session_state.plot_center = centre
-        st.session_state.plot_lang = lang
-        st.session_state.plot_range = (d_from, d_to)
-        st.session_state.plot_dirty = False
+        with overlay("Preparing editable grid…"):
+            grid = _plotter_load_grid(db, centre, lang, d_from, d_to)
+            st.session_state.plot_grid = grid
+            st.session_state.plot_center = centre
+            st.session_state.plot_lang = lang
+            st.session_state.plot_range = (d_from, d_to)
+            st.session_state.plot_dirty = False
 
     if (st.session_state.plot_grid is None or
         st.session_state.plot_center != centre or
@@ -1778,22 +1852,23 @@ def render_plotter(db):
 
         can_edit_here = db._can_edit_center(centre)
         if b4.button("Save", type="primary", disabled=not can_edit_here):
-            grid = st.session_state.plot_grid
-            if grid is None or grid.empty or grid.shape[1] < 2:
-                st.warning("Nothing to save.")
-            else:
-                req_df = _grid_to_requested_df(grid, d_from.year)
-                edits = {}
-                for sh, row in req_df.iterrows():
-                    for d, v in row.items():
-                        if float(v) != 0.0:
-                            edits[(sh, d)] = float(v)
-                if edits:
-                    db.upsert_requested_cells(centre, lang, edits)
-                    st.success(f"Saved {len(edits)} cells.")
-                    st.session_state.plot_dirty = False
+            with overlay("Saving Requested edits…"):
+                grid = st.session_state.plot_grid
+                if grid is None or grid.empty or grid.shape[1] < 2:
+                    st.warning("Nothing to save.")
                 else:
-                    st.info("No non-zero changes to save.")
+                    req_df = _grid_to_requested_df(grid, d_from.year)
+                    edits = {}
+                    for sh, row in req_df.iterrows():
+                        for d, v in row.items():
+                            if float(v) != 0.0:
+                                edits[(sh, d)] = float(v)
+                    if edits:
+                        db.upsert_requested_cells(centre, lang, edits)
+                        st.success(f"Saved {len(edits)} cells.")
+                        st.session_state.plot_dirty = False
+                    else:
+                        st.info("No non-zero changes to save.")
 
     st.caption("Editing: " + ("ENABLED" if db._can_edit_center(centre) else "VIEW ONLY"))
     st.markdown("---")
@@ -1862,7 +1937,7 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
         ids_text = st.text_input("Genesys IDs (comma/space)", disabled=disabled)
         ids = [x.strip() for x in re.findall(r"[A-Za-z0-9_]+", ids_text)] if ids_text else None
 
-    with st.spinner("Loading roster…"):
+    with overlay("Loading roster…"):
         dfr = roster[roster["Date"].between(start, end)].copy()
         if center and center != "Overall": dfr = dfr[dfr["Center"] == center]
         if lob: dfr = dfr[dfr["LOB"] == lob]
@@ -1928,69 +2003,78 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
                 if not norm:
                     st.error("Invalid shift format.")
                 else:
-                    try:
-                        if DUCKDB_FILE_NAME:
-                            local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                            if err or not local_db or not file_id:
-                                st.error(f"DuckDB issue: {err or 'File not found.'}")
+                    with overlay("Updating shifts…"):
+                        try:
+                            if DUCKDB_FILE_NAME:
+                                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                                if err or not local_db or not file_id:
+                                    st.error(f"DuckDB issue: {err or 'File not found.'}")
+                                else:
+                                    con = duckdb.connect(local_db, read_only=False)
+                                    _ensure_duckdb_schema(con)
+                                    con.execute("""
+                                        UPDATE roster_long
+                                        SET Shift = ?
+                                        WHERE Center = ? AND AgentID = ? AND Date BETWEEN ? AND ?
+                                    """, [norm, center, agent, d_from, d_to])
+                                    con.close()
+                                    _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
+                                    load_from_duckdb.clear()
+                                    st.success("Shift updated.")
                             else:
-                                con = duckdb.connect(local_db, read_only=False)
-                                _ensure_duckdb_schema(con)
-                                con.execute("""
-                                    UPDATE roster_long
-                                    SET Shift = ?
-                                    WHERE Center = ? AND AgentID = ? AND Date BETWEEN ? AND ?
-                                """, [norm, center, agent, d_from, d_to])
-                                con.close()
-                                _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
-                                load_from_duckdb.clear()
-                                st.success("Shift updated.")
-                        else:
-                            cur = load_parquet_from_drive(ROSTER_FILE)
-                            if cur.empty:
-                                st.error("No roster parquet to update.")
-                            else:
-                                cur["Date"] = pd.to_datetime(cur["Date"]).dt.date
-                                mask = (cur["Center"]==center) & (cur["AgentID"].astype(str)==agent) & (cur["Date"].between(d_from, d_to))
-                                cur.loc[mask, "Shift"] = norm
-                                save_parquet_to_drive(ROSTER_FILE, cur)
-                                st.success("Shift updated in Parquet.")
-                    except Exception as e:
-                        st.error(f"Update failed: {e}")
+                                cur = load_parquet_from_drive(ROSTER_FILE)
+                                if cur.empty:
+                                    st.error("No roster parquet to update.")
+                                else:
+                                    cur["Date"] = pd.to_datetime(cur["Date"]).dt.date
+                                    mask = (cur["Center"] == center) & (cur["AgentID"].astype(str) == agent) & (
+                                        cur["Date"].between(d_from, d_to))
+                                    cur.loc[mask, "Shift"] = norm
+                                    save_parquet_to_drive(ROSTER_FILE, cur)
+                                    st.success("Shift updated in Parquet.")
+                        except Exception as e:
+                            st.error(f"Update failed: {e}")
         else:
             st.caption("Upload a roster file to bulk replace (validation rules TBD).")
             up = st.file_uploader("Roster (.xlsx) with 'Roster' sheet", type=["xlsx"], key="bulk_roster_up")
+
             if st.button("Upload & Replace for this Center", type="primary", disabled=not up):
                 raw = read_roster_sheet(up.read())
                 if raw.empty:
                     st.error("No 'Roster' sheet found or it's empty.")
                 else:
-                    try:
-                        if DUCKDB_FILE_NAME:
-                            local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                            if err or not local_db or not file_id:
-                                st.error(f"DuckDB issue: {err or 'File not found.'}")
-                            else:
-                                if "Date" not in raw or "Shift" not in raw:
-                                    st.error("File must contain at least 'Date' and 'Shift' columns.")
+                    with overlay(f"Replacing roster for {center}…"):
+                        raw = read_roster_sheet(up.read())
+                        if raw.empty:
+                            st.error("No 'Roster' sheet found or it's empty.")
+                        else:
+                            try:
+                                if DUCKDB_FILE_NAME:
+                                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                                    if err or not local_db or not file_id:
+                                        st.error(f"DuckDB issue: {err or 'File not found.'}")
+                                    else:
+                                        if "Date" not in raw or "Shift" not in raw:
+                                            st.error("File must contain at least 'Date' and 'Shift' columns.")
+                                        else:
+                                            raw["Center"] = center
+                                            raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
+                                            inserted = duckdb_replace_roster_for_center(local_db, file_id,
+                                                                                        DUCKDB_FILE_NAME, raw, center)
+                                            st.success(f"Roster replaced for {center}. Rows after replace: {inserted}")
                                 else:
+                                    cur = load_parquet_from_drive(ROSTER_FILE)
                                     raw["Center"] = center
                                     raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                    inserted = duckdb_replace_roster_for_center(local_db, file_id, DUCKDB_FILE_NAME, raw, center)
-                                    st.success(f"Roster replaced for {center}. Rows after replace: {inserted}")
-                        else:
-                            cur = load_parquet_from_drive(ROSTER_FILE)
-                            raw["Center"] = center
-                            raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                            if cur.empty:
-                                save_parquet_to_drive(ROSTER_FILE, raw)
-                            else:
-                                keep = cur[cur.get("Center","").astype(str) != center]
-                                new_all = pd.concat([keep, raw], ignore_index=True)
-                                save_parquet_to_drive(ROSTER_FILE, new_all)
-                            st.success(f"Roster replaced in Parquet for {center}. Rows added: {len(raw)}")
-                    except Exception as e:
-                        st.error(f"Bulk replace failed: {e}")
+                                    if cur.empty:
+                                        save_parquet_to_drive(ROSTER_FILE, raw)
+                                    else:
+                                        keep = cur[cur.get("Center", "").astype(str) != center]
+                                        new_all = pd.concat([keep, raw], ignore_index=True)
+                                        save_parquet_to_drive(ROSTER_FILE, new_all)
+                                    st.success(f"Roster replaced in Parquet for {center}. Rows added: {len(raw)}")
+                            except Exception as e:
+                                st.error(f"Bulk replace failed: {e}")
 
     st.button("Edit / Update Roster", on_click=lambda: roster_edit_dialog(roster),
               type="primary", disabled=not can_edit_this_center)
