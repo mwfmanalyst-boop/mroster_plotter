@@ -178,6 +178,41 @@ input, textarea {
     max-width: 1400px;
     margin-top: 18px !important;
 }
+/* ==== KPI gradient cards ==== */
+.kpi-card{
+  display:flex; flex-direction:column; justify-content:flex-start; 
+  border-radius:22px; padding:18px 22px; min-height:110px;
+  border:1px solid rgba(255,255,255,0.22);
+  box-shadow: 0 10px 36px rgba(31,38,135,0.18);
+  color:#fff;
+  backdrop-filter: blur(10px);
+}
+.kpi-label{
+  font-size:14px; font-weight:700; letter-spacing:.3px; opacity:.92;
+  margin-bottom:8px; text-shadow: 0 1px 6px rgba(0,0,0,.18);
+}
+.kpi-value{
+  font-size:42px; line-height:1; font-weight:800;
+  text-shadow: 0 2px 14px rgba(0,0,0,.28);
+}
+
+/* variants */
+.kpi-purple{
+  background: linear-gradient(135deg,#a78bfa 0%, #7c3aed 100%);
+}
+.kpi-yellow{
+  background: linear-gradient(135deg,#fde68a 0%, #f59e0b 100%);
+  color:#1f2937; /* darker text for contrast on yellow */
+}
+.kpi-green{
+  background: linear-gradient(135deg,#86efac 0%, #22c55e 100%);
+}
+.kpi-red{
+  background: linear-gradient(135deg,#fda4af 0%, #ef4444 100%);
+}
+.kpi-neutral{
+  background: linear-gradient(135deg,#94a3b8 0%, #64748b 100%);
+}
 
 </style>
 """, unsafe_allow_html=True)
@@ -1559,10 +1594,58 @@ ros_shift_total = add_total_row(ros_shift)
 delt_shift_total = add_total_row(delt_shift)
 
 # KPI row
+# ==== KPI row (gradient cards) ====
+def _fmt_int(n: float|int) -> str:
+    try:
+        v = int(round(float(n)))
+        return f"{v:,}"
+    except Exception:
+        return str(n)
+
+req_total  = _pretty_int(req_shift.values.sum())
+ros_total  = _pretty_int(ros_shift.values.sum())
+delta_total = _pretty_int(delt_shift.values.sum())
+
+delta_class = "kpi-neutral"
+if delta_total > 0:
+    delta_class = "kpi-green"
+elif delta_total < 0:
+    delta_class = "kpi-red"
+
 k1, k2, k3 = st.columns(3)
-with k1: st.metric("Requested", _pretty_int(req_shift.values.sum()))
-with k2: st.metric("Rostered", _pretty_int(ros_shift.values.sum()))
-with k3: st.metric("Delta", _pretty_int(delt_shift.values.sum()))
+
+with k1:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-purple">
+          <div class="kpi-label">Requested</div>
+          <div class="kpi-value">{_fmt_int(req_total)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with k2:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-yellow">
+          <div class="kpi-label">Rostered</div>
+          <div class="kpi-value">{_fmt_int(ros_total)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with k3:
+    st.markdown(
+        f"""
+        <div class="kpi-card {delta_class}">
+          <div class="kpi-label">Delta</div>
+          <div class="kpi-value">{_fmt_int(delta_total)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # =========================
 # Renderers
@@ -2182,3 +2265,4 @@ elif tab_choice == "Roster":
 else:
     all_centers_no_overall = [c for c in _centers_union(records, roster) if c and c != "Overall"]
     render_admin_panel(all_centers_no_overall, ACL, user.get("email",""))
+
