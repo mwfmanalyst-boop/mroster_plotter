@@ -1001,6 +1001,33 @@ def _languages_union(records: pd.DataFrame, roster: pd.DataFrame, center: Option
         a = unique_lang(records[records["Center"]==center]) if "Center" in records else set()
         b = unique_lang(roster[roster["Center"]==center]) if "Center" in roster else set()
         return sorted([l for l in (a | b) if l])
+def _ensure_roster_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures roster has canonical columns: 'Date' and 'Shift'.
+    Accepts common variants like 'date', 'DATE', or 'Reason' (for Shift).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Date", "Shift"])
+    out = df.copy()
+
+    # Map variants -> canonical
+    cols_lower = {c.lower(): c for c in out.columns}
+
+    def _alias(*names):
+        for n in names:
+            if n.lower() in cols_lower:
+                return cols_lower[n.lower()]
+        return None
+
+    date_col  = _alias("Date", "date", "DATE")
+    shift_col = _alias("Shift", "shift", "SHIFT", "Reason", "reason")
+
+    if date_col and date_col != "Date":
+        out = out.rename(columns={date_col: "Date"})
+    if shift_col and shift_col != "Shift":
+        out = out.rename(columns={shift_col: "Shift"})
+
+    return out
 
 def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
     diags = {}
@@ -1031,10 +1058,17 @@ def load_store() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str]]:
             records = records[records["Metric"] == "Requested"].copy()
 
     if not roster.empty:
-        roster["Date"] = pd.to_datetime(roster["Date"]).dt.date
+        # Ensure canonical columns exist
+        roster = _ensure_roster_schema(roster)
+
+        if "Date" in roster.columns:
+            roster["Date"] = pd.to_datetime(roster["Date"], errors="coerce").dt.date
+
+        # Clean important columns if present
         for c in ["AgentID", "Language", "Center", "LOB", "Shift"]:
             if c in roster.columns:
                 roster[c] = roster[c].astype(str).str.strip()
+
         if "Shift" in roster.columns:
             roster["Shift"] = roster["Shift"].apply(
                 lambda s: (_normalize_shift_label(s) or str(s).strip().upper())
@@ -2001,6 +2035,14 @@ def render_plotter(db):
     )
 
 def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
+    # Normalize/validate schema first
+    roster = _ensure_roster_schema(roster)
+
+    # Fast guard: show message if required columns are missing
+    if roster.empty or "Date" not in roster.columns:
+        st.warning("Roster table has no 'Date' column. Please import a valid roster with a 'Roster' sheet containing at least 'Date' and 'Shift'.")
+        return
+
     def _roster_set_busy():
         st.session_state.busy_roster = True
     disabled = st.session_state.busy_roster
@@ -2026,15 +2068,30 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
         ids_text = st.text_input("Genesys IDs (comma/space)", disabled=disabled)
         ids = [x.strip() for x in re.findall(r"[A-Za-z0-9_]+", ids_text)] if ids_text else None
 
+    # Use full-screen overlay for the heavy filtering/rendering block
     with overlay("Loading roster…"):
-        dfr = roster[roster["Date"].between(start, end)].copy()
-        if center and center != "Overall": dfr = dfr[dfr["Center"] == center]
-        if lob: dfr = dfr[dfr["LOB"] == lob]
-        if rlang: dfr = dfr[dfr["Language"] == rlang]
-        if ids: dfr = dfr[dfr["AgentID"].isin(ids)]
+        dfr = roster.copy()
+
+        # Date filter (safe: 'Date' exists by now)
+        dfr = dfr[dfr["Date"].between(start, end)]
+
+        # Optional filters
+        if center and center != "Overall": 
+            if "Center" in dfr.columns:
+                dfr = dfr[dfr["Center"] == center]
+        if lob and "LOB" in dfr.columns:
+            dfr = dfr[dfr["LOB"] == lob]
+        if rlang and "Language" in dfr.columns:
+            dfr = dfr[dfr["Language"] == rlang]
+        if ids and "AgentID" in dfr.columns:
+            dfr = dfr[dfr["AgentID"].isin(ids)]
+
+        # Normalize Shift again post-filter (defensive)
         if not dfr.empty and "Shift" in dfr.columns:
             dfr["Shift"] = dfr["Shift"].apply(lambda s: (_normalize_shift_label(s) or str(s).strip().upper()))
-        if not dfr.empty:
+
+        # Apply Non-Shift vs Shift filters
+        if not dfr.empty and "Shift" in dfr.columns:
             time_like = re.compile(r"^\d{4}-\d{4}(?:/\d{4}-\d{4})*$")
             single_pat = re.compile(r"^\d{4}-\d{4}$")
             if nonshift_sel not in ("", "(All)"):
@@ -2052,14 +2109,15 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
                     return False
                 dfr = dfr[dfr["Shift"].apply(keep_shift)]
 
-        # Reorder columns: Date first (formatted)
+        # Reorder and format for display
         static_cols = [c for c in [
             "AgentID","AgentName","TLName","Status","WorkMode","Center","Location",
             "Language","SecondaryLanguage","LOB","FTPT","Shift"
         ] if c in dfr.columns]
+
         if not dfr.empty:
             long_df = dfr[["Date"] + static_cols].copy()
-            long_df["Date"] = pd.to_datetime(long_df["Date"]).dt.strftime("%d-%b-%y")
+            long_df["Date"] = pd.to_datetime(long_df["Date"], errors="coerce").dt.strftime("%d-%b-%y")
         else:
             long_df = pd.DataFrame(columns=["Date"] + static_cols)
 
@@ -2116,8 +2174,7 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
                                     st.error("No roster parquet to update.")
                                 else:
                                     cur["Date"] = pd.to_datetime(cur["Date"]).dt.date
-                                    mask = (cur["Center"] == center) & (cur["AgentID"].astype(str) == agent) & (
-                                        cur["Date"].between(d_from, d_to))
+                                    mask = (cur["Center"]==center) & (cur["AgentID"].astype(str)==agent) & (cur["Date"].between(d_from, d_to))
                                     cur.loc[mask, "Shift"] = norm
                                     save_parquet_to_drive(ROSTER_FILE, cur)
                                     st.success("Shift updated in Parquet.")
@@ -2126,44 +2183,38 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
         else:
             st.caption("Upload a roster file to bulk replace (validation rules TBD).")
             up = st.file_uploader("Roster (.xlsx) with 'Roster' sheet", type=["xlsx"], key="bulk_roster_up")
-
             if st.button("Upload & Replace for this Center", type="primary", disabled=not up):
-                raw = read_roster_sheet(up.read())
-                if raw.empty:
-                    st.error("No 'Roster' sheet found or it's empty.")
-                else:
-                    with overlay(f"Replacing roster for {center}…"):
-                        raw = read_roster_sheet(up.read())
-                        if raw.empty:
-                            st.error("No 'Roster' sheet found or it's empty.")
-                        else:
-                            try:
-                                if DUCKDB_FILE_NAME:
-                                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                                    if err or not local_db or not file_id:
-                                        st.error(f"DuckDB issue: {err or 'File not found.'}")
-                                    else:
-                                        if "Date" not in raw or "Shift" not in raw:
-                                            st.error("File must contain at least 'Date' and 'Shift' columns.")
-                                        else:
-                                            raw["Center"] = center
-                                            raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                            inserted = duckdb_replace_roster_for_center(local_db, file_id,
-                                                                                        DUCKDB_FILE_NAME, raw, center)
-                                            st.success(f"Roster replaced for {center}. Rows after replace: {inserted}")
+                with overlay(f"Replacing roster for {center}…"):
+                    raw = read_roster_sheet(up.read())
+                    if raw.empty:
+                        st.error("No 'Roster' sheet found or it's empty.")
+                    else:
+                        try:
+                            if DUCKDB_FILE_NAME:
+                                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                                if err or not local_db or not file_id:
+                                    st.error(f"DuckDB issue: {err or 'File not found.'}")
                                 else:
-                                    cur = load_parquet_from_drive(ROSTER_FILE)
-                                    raw["Center"] = center
-                                    raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                    if cur.empty:
-                                        save_parquet_to_drive(ROSTER_FILE, raw)
+                                    if "Date" not in raw or "Shift" not in raw:
+                                        st.error("File must contain at least 'Date' and 'Shift' columns.")
                                     else:
-                                        keep = cur[cur.get("Center", "").astype(str) != center]
-                                        new_all = pd.concat([keep, raw], ignore_index=True)
-                                        save_parquet_to_drive(ROSTER_FILE, new_all)
-                                    st.success(f"Roster replaced in Parquet for {center}. Rows added: {len(raw)}")
-                            except Exception as e:
-                                st.error(f"Bulk replace failed: {e}")
+                                        raw["Center"] = center
+                                        raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
+                                        inserted = duckdb_replace_roster_for_center(local_db, file_id, DUCKDB_FILE_NAME, raw, center)
+                                        st.success(f"Roster replaced for {center}. Rows after replace: {inserted}")
+                            else:
+                                cur = load_parquet_from_drive(ROSTER_FILE)
+                                raw["Center"] = center
+                                raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
+                                if cur.empty:
+                                    save_parquet_to_drive(ROSTER_FILE, raw)
+                                else:
+                                    keep = cur[cur.get("Center","").astype(str) != center]
+                                    new_all = pd.concat([keep, raw], ignore_index=True)
+                                    save_parquet_to_drive(ROSTER_FILE, new_all)
+                                st.success(f"Roster replaced in Parquet for {center}. Rows added: {len(raw)}")
+                        except Exception as e:
+                            st.error(f"Bulk replace failed: {e}")
 
     st.button("Edit / Update Roster", on_click=lambda: roster_edit_dialog(roster),
               type="primary", disabled=not can_edit_this_center)
@@ -2265,4 +2316,3 @@ elif tab_choice == "Roster":
 else:
     all_centers_no_overall = [c for c in _centers_union(records, roster) if c and c != "Overall"]
     render_admin_panel(all_centers_no_overall, ACL, user.get("email",""))
-
