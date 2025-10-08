@@ -515,7 +515,13 @@ def _drive_upload_bytes(service, name: str, data: bytes, mime: str, folder_id: O
     return file["id"]
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _drive_list_folder(service, folder_id: str) -> list[dict]:
+@st.cache_data(ttl=120, show_spinner=False)
+def _drive_list_folder(folder_id: str) -> list[dict]:
+    """
+    Cached list of files in a Drive folder.
+    Only accepts hashable parameters so Streamlit cache works.
+    """
+    service = _get_drive_service()  # this is @st.cache_resource in your code
     items = []
     page_token = None
     while True:
@@ -1400,7 +1406,7 @@ with st.sidebar:
         else:
             try:
                 service = _get_drive_service()
-                files = _drive_list_folder(service, REQUESTED_FOLDER_ID)
+                files = _drive_list_folder(REQUESTED_FOLDER_ID)
                 names = [f['name'] for f in files if f.get('mimeType') != 'application/vnd.google-apps.folder']
                 sel = st.selectbox("Pick a file from Drive", names)
                 if sel:
@@ -1458,7 +1464,7 @@ with st.sidebar:
         else:
             try:
                 service = _get_drive_service()
-                files = _drive_list_folder(service, ROSTER_FOLDER_ID)
+                files = _drive_list_folder(ROSTER_FOLDER_ID)
                 names = [f['name'] for f in files if f.get('mimeType') != 'application/vnd.google-apps.folder']
                 sel = st.selectbox("Pick a roster file from Drive", names)
                 if sel:
