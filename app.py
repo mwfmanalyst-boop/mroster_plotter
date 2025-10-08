@@ -768,6 +768,7 @@ def load_from_duckdb(db_name: str, _schema_version: int = 2) -> Tuple[pd.DataFra
     return df_records, df_roster, diags
 
 def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
+    # base tables
     con.execute("""
         CREATE TABLE IF NOT EXISTS records (
             Center VARCHAR, Language VARCHAR, Shift VARCHAR,
@@ -780,6 +781,70 @@ def _ensure_duckdb_schema(con: duckdb.DuckDBPyConnection):
             Status VARCHAR, WorkMode VARCHAR, Center VARCHAR, Location VARCHAR,
             Language VARCHAR, SecondaryLanguage VARCHAR, LOB VARCHAR, FTPT VARCHAR,
             BaseShift VARCHAR, Date DATE, Shift VARCHAR
+        );
+    """)
+
+    # submissions (approval flow)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            request_id VARCHAR PRIMARY KEY,
+            mode VARCHAR,                 -- 'Single' | 'Bulk'
+            center VARCHAR,
+            uploaded_by VARCHAR,
+            from_date DATE,
+            to_date DATE,
+            status VARCHAR,               -- 'Pending' | 'Approved' | 'Deny'
+            reason VARCHAR,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        );
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS submission_items (
+            request_id VARCHAR,
+            AgentID VARCHAR,
+            Date DATE,
+            Shift VARCHAR,
+            TLName VARCHAR,
+            Status VARCHAR,
+            Language VARCHAR,
+            LOB VARCHAR,
+            WorkMode VARCHAR,
+            PRIMARY KEY (request_id, AgentID, Date)
+        );
+    """)
+
+    # center edit access switches
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS center_permissions (
+            center VARCHAR PRIMARY KEY,
+            can_edit BOOLEAN
+        );
+    """)
+
+    # admin-managed shift codes
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS shift_codes (
+            code VARCHAR PRIMARY KEY,
+            label VARCHAR,
+            category VARCHAR,             -- e.g., OFF, LEAVE, ACTIVITY
+            is_time_code BOOLEAN,         -- if FALSE, passes w/o time validation
+            min_duration_minutes INTEGER, -- optional
+            notes VARCHAR,
+            is_enabled BOOLEAN
+        );
+    """)
+
+    # audit log
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            log_id VARCHAR,               -- uuid
+            action VARCHAR,
+            center VARCHAR,
+            actor VARCHAR,
+            info VARCHAR,
+            created_at TIMESTAMP
         );
     """)
 
@@ -848,6 +913,121 @@ def duckdb_replace_roster_for_center(local_db_path: str, file_id: str, name_in_d
     _upload_duckdb_back(local_db_path, file_id, name_in_drive)
     load_from_duckdb.clear()
     return int(inserted)
+import uuid
+from datetime import datetime as _dt
+
+def _audit_log(con: duckdb.DuckDBPyConnection, action: str, center: str, actor: str, info: str):
+    con.execute("""
+        INSERT INTO audit_log (log_id, action, center, actor, info, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, [str(uuid.uuid4()), action, center, actor, info, _dt.utcnow()])
+
+def submit_roster_request(mode: str, center: str, uploaded_by: str,
+                          from_date: date, to_date: date, items_df: pd.DataFrame) -> str:
+    """Create a Pending submission + item rows; returns request_id."""
+    request_id = str(uuid.uuid4())
+    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+    if err or not local_db or not file_id:
+        raise RuntimeError(f"DuckDB issue: {err or 'File not found.'}")
+    con = duckdb.connect(local_db, read_only=False)
+    _ensure_duckdb_schema(con)
+    now = _dt.utcnow()
+    con.execute("""
+        INSERT INTO submissions (request_id, mode, center, uploaded_by, from_date, to_date, status, reason, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'Pending', '', ?, ?)
+    """, [request_id, mode, center, uploaded_by, from_date, to_date, now, now])
+
+    if not items_df.empty:
+        con.register("items_src", items_df)
+        con.execute("""
+            INSERT INTO submission_items
+            SELECT ?, AgentID, Date, Shift, TLName, Status, Language, LOB, WorkMode
+            FROM items_src
+        """, [request_id])
+
+    _audit_log(con, f"Submit-{mode}", center, uploaded_by, f"{len(items_df)} rows; {from_date}..{to_date}")
+    con.close()
+    _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
+    load_from_duckdb.clear()
+    return request_id
+
+def admin_approve_request(request_id: str, actor_email: str):
+    """Commit items into roster_long; mark submission Approved."""
+    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+    if err or not local_db or not file_id:
+        raise RuntimeError(f"DuckDB issue: {err or 'File not found.'}")
+    con = duckdb.connect(local_db, read_only=False)
+    _ensure_duckdb_schema(con)
+
+    # load header
+    hdr = con.execute("SELECT center, from_date, to_date FROM submissions WHERE request_id = ?", [request_id]).df()
+    if hdr.empty:
+        con.close(); raise RuntimeError("Request not found")
+    center = str(hdr.iloc[0]["center"])
+
+    # apply rows (upsert per AgentID+Date)
+    con.execute("CREATE TEMP TABLE _items AS SELECT * FROM submission_items WHERE request_id = ?", [request_id])
+    con.execute("""
+        UPDATE roster_long AS r
+        SET Shift = i.Shift,
+            TLName = COALESCE(NULLIF(i.TLName,''), r.TLName),
+            Status = COALESCE(NULLIF(i.Status,''), r.Status),
+            Language = COALESCE(NULLIF(i.Language,''), r.Language),
+            LOB = COALESCE(NULLIF(i.LOB,''), r.LOB),
+            WorkMode = COALESCE(NULLIF(i.WorkMode,''), r.WorkMode)
+        FROM _items AS i
+        WHERE r.Center = ?
+          AND r.AgentID = i.AgentID
+          AND r.Date = i.Date
+    """, [center])
+
+    con.execute("""
+        INSERT INTO roster_long
+        SELECT i.AgentID, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, i.Date, i.Shift
+        FROM _items i
+        LEFT JOIN roster_long r ON r.Center = ? AND r.AgentID = i.AgentID AND r.Date = i.Date
+        WHERE r.AgentID IS NULL
+    """, [center, center])
+
+    con.execute("UPDATE submissions SET status='Approved', updated_at=? WHERE request_id=?", [_dt.utcnow(), request_id])
+    _audit_log(con, "Approve", center, actor_email, f"request_id={request_id}")
+
+    con.close()
+    _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
+    load_from_duckdb.clear()
+
+def admin_deny_request(request_id: str, actor_email: str, reason: str):
+    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+    if err or not local_db or not file_id:
+        raise RuntimeError(f"DuckDB issue: {err or 'File not found.'}")
+    con = duckdb.connect(local_db, read_only=False)
+    _ensure_duckdb_schema(con)
+    con.execute("UPDATE submissions SET status='Deny', reason=?, updated_at=? WHERE request_id=?",
+                [reason or "(no reason)", _dt.utcnow(), request_id])
+    # capture center for log
+    hdr = con.execute("SELECT center FROM submissions WHERE request_id=?", [request_id]).df()
+    center = str(hdr.iloc[0]["center"]) if not hdr.empty else ""
+    _audit_log(con, "Deny", center, actor_email, f"request_id={request_id}; reason={reason}")
+    con.close()
+    _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
+    load_from_duckdb.clear()
+def center_can_edit(center: str) -> bool:
+    if not DUCKDB_FILE_NAME:
+        return True  # Parquet mode: keep current behavior
+    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+    if err or not local_db or not file_id:
+        return True
+    con = duckdb.connect(local_db, read_only=True)
+    try:
+        _ensure_duckdb_schema(con)
+        df = con.execute("SELECT can_edit FROM center_permissions WHERE center = ?", [center]).df()
+        if df.empty:
+            return True
+        return bool(df.iloc[0]["can_edit"])
+    except Exception:
+        return True
+    finally:
+        con.close()
 
 # =========================
 # Parsing helpers (Requested workbook)
@@ -922,6 +1102,17 @@ def _normalize_shift_label(s: str) -> Optional[str]:
         sm = max(0, min(59, sm)); em = max(0, min(59, em))
         norm_parts.append(f"{sh:02d}{sm:02d}-{eh:02d}{em:02d}")
     return "/".join(norm_parts)
+# ===== SOP Allowed Values & Limits =====
+ALLOWED_STATUS = {
+    "BAU","Nesting Week 4","Nesting Week 3","Nesting Week 2","Nesting Week 1",
+    "AUX Trainer","AUX QA","Floor Support","OJT","Aux TL","Certification","Training"
+}
+ALLOWED_PRIMARY_LANGUAGE = {
+    "English","Kannada","Telugu","Tamil","Bengali","Hindi","Hindi_GIG","Bengali_GIG",
+    "English_GIG","Telugu_GIG","Malayalam"
+}
+ALLOWED_WORKMODE = {"WFO","WFH"}
+MAX_EDIT_WINDOW_DAYS = 7  # ≤7 days per SOP
 
 def parse_center_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
     df = pd.read_excel(xls, sheet_name, header=None)
@@ -1091,6 +1282,85 @@ def _minutes_of(label: str) -> Optional[int]:
     sh, sm, eh, em = int(s[0:2]), int(s[2:4]), int(s[5:7]), int(s[7:9])
     start = sh*60 + sm; end = eh*60 + em
     return (end - start) if end > start else None
+def _duration_minutes(label: str) -> Optional[int]:
+    """Return duration minutes for a single-segment 'HHMM-HHMM' (no splits)."""
+    m = re.fullmatch(r"^\s*(\d{2})(\d{2})-(\d{2})(\d{2})\s*$", str(label))
+    if not m: return None
+    sh, sm, eh, em = map(int, m.groups())
+    start = sh*60 + sm
+    end   = eh*60 + em
+    if end <= start:   # disallow negative or cross-midnight for validation calc
+        return None
+    return end - start
+
+def _is_dynamic_code(s: str) -> bool:
+    s = str(s).strip().upper()
+    return s in {"WO","CL","FS"}  # extended via shift_codes table as well
+
+def validate_shift_value(raw: str, con: duckdb.DuckDBPyConnection | None = None) -> tuple[bool,str]:
+    """
+    Returns (is_valid, reason).
+    Rules:
+      - Dynamic codes: WO, CL, FS (plus enabled shift_codes with is_time_code=False)
+      - Single time range: HHMM-HHMM with duration >= 540 minutes (9h)
+      - Split ranges: HHMM-HHMM/HHMM-HHMM must be exactly 5h + 4h (order agnostic)
+    """
+    s = (raw or "").strip().upper()
+    if not s:
+        return False, "Empty shift"
+
+    # admin-managed codes
+    if con is not None:
+        try:
+            cfg = con.execute("SELECT code, is_time_code FROM shift_codes WHERE is_enabled = TRUE").df()
+            codes = {str(r["code"]).upper(): bool(r["is_time_code"]) for _, r in cfg.iterrows()} if not cfg.empty else {}
+        except Exception:
+            codes = {}
+    else:
+        codes = {}
+
+    # dynamic/non-time codes
+    if _is_dynamic_code(s) or (s in codes and codes[s] is False):
+        return True, ""
+
+    # time patterns
+    parts = [p.strip() for p in s.split("/") if p.strip()]
+    if len(parts) == 1:
+        d = _duration_minutes(parts[0])
+        if d is None:
+            return False, "Invalid time pattern for single range"
+        if d < 540:
+            return False, "Single range must be ≥ 9h"
+        return True, ""
+    elif len(parts) == 2:
+        d1 = _duration_minutes(parts[0])
+        d2 = _duration_minutes(parts[1])
+        if d1 is None or d2 is None:
+            return False, "Invalid time pattern in split"
+        if sorted([d1, d2]) != [240, 300]:
+            return False, "Split must be 5h + 4h"
+        return True, ""
+    else:
+        return False, "Too many segments (max 2)"
+def validate_allowed_values(row: dict) -> list[str]:
+    """Return list of error messages for a roster edit row."""
+    errs = []
+    status = str(row.get("Status","")).strip()
+    lang   = str(row.get("Language","")).strip()
+    wm     = str(row.get("WorkMode","")).strip()
+
+    if status and status not in ALLOWED_STATUS:
+        errs.append(f"Invalid Status: {status}")
+    if lang and lang not in ALLOWED_PRIMARY_LANGUAGE:
+        errs.append(f"Invalid Primary Language: {lang}")
+    if wm and wm not in ALLOWED_WORKMODE:
+        errs.append(f"Invalid WorkMode: {wm}")
+    return errs
+
+def validate_window(from_date: date, to_date: date) -> Optional[str]:
+    if (to_date - from_date).days > (MAX_EDIT_WINDOW_DAYS - 1):
+        return f"Window must be ≤ {MAX_EDIT_WINDOW_DAYS} days"
+    return None
 
 @st.cache_data(show_spinner=False, ttl=600)
 def dedup_requested_split_pairs(pivot_df: pd.DataFrame) -> pd.DataFrame:
@@ -2035,6 +2305,10 @@ def render_plotter(db):
     )
 
 def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
+    # --- Admin center toggle (read-only guard)
+    center_edit_ok = center_can_edit(center) if center else False
+    if not center_edit_ok:
+        st.info("✋ This center is currently **read-only** (edit access disabled by Admin).")
     # Normalize/validate schema first
     roster = _ensure_roster_schema(roster)
 
@@ -2076,7 +2350,7 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
         dfr = dfr[dfr["Date"].between(start, end)]
 
         # Optional filters
-        if center and center != "Overall": 
+        if center and center != "Overall":
             if "Center" in dfr.columns:
                 dfr = dfr[dfr["Center"] == center]
         if lob and "LOB" in dfr.columns:
@@ -2150,85 +2424,316 @@ def render_roster(roster: pd.DataFrame, center: str, start: date, end: date):
                 if not norm:
                     st.error("Invalid shift format.")
                 else:
-                    with overlay("Updating shifts…"):
+                    with overlay("Validating & submitting…"):
                         try:
+                            # validations
+                            werr = validate_window(d_from, d_to)
+                            if werr:
+                                st.error(werr);
+                                return
+
+                            # build items df for [AgentID × date range], single Shift applied per day
+                            dates = pd.date_range(d_from, d_to, freq="D").date
+                            # validate shift value with admin-managed codes
                             if DUCKDB_FILE_NAME:
                                 local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                                if err or not local_db or not file_id:
-                                    st.error(f"DuckDB issue: {err or 'File not found.'}")
-                                else:
-                                    con = duckdb.connect(local_db, read_only=False)
-                                    _ensure_duckdb_schema(con)
-                                    con.execute("""
-                                        UPDATE roster_long
-                                        SET Shift = ?
-                                        WHERE Center = ? AND AgentID = ? AND Date BETWEEN ? AND ?
-                                    """, [norm, center, agent, d_from, d_to])
-                                    con.close()
-                                    _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
-                                    load_from_duckdb.clear()
-                                    st.success("Shift updated.")
+                                if err:
+                                    st.error(err);
+                                    return
+                                con = duckdb.connect(local_db, read_only=True)
                             else:
-                                cur = load_parquet_from_drive(ROSTER_FILE)
-                                if cur.empty:
-                                    st.error("No roster parquet to update.")
-                                else:
-                                    cur["Date"] = pd.to_datetime(cur["Date"]).dt.date
-                                    mask = (cur["Center"]==center) & (cur["AgentID"].astype(str)==agent) & (cur["Date"].between(d_from, d_to))
-                                    cur.loc[mask, "Shift"] = norm
-                                    save_parquet_to_drive(ROSTER_FILE, cur)
-                                    st.success("Shift updated in Parquet.")
+                                con = None
+
+                            ok, reason = validate_shift_value(norm, con)
+                            if con is not None:
+                                try:
+                                    con.close()
+                                except:
+                                    pass
+                            if not ok:
+                                st.error(f"Shift invalid: {reason}")
+                                return
+
+                            items = []
+                            for d in dates:
+                                items.append({
+                                    "AgentID": str(agent).strip(),
+                                    "Date": d,
+                                    "Shift": norm,
+                                    "TLName": None,
+                                    "Status": None,
+                                    "Language": None,
+                                    "LOB": None,
+                                    "WorkMode": None
+                                })
+                            df_items = pd.DataFrame(items)
+
+                            req_id = submit_roster_request(
+                                mode="Single",
+                                center=center,
+                                uploaded_by=user.get("email", ""),
+                                from_date=d_from,
+                                to_date=d_to,
+                                items_df=df_items
+                            )
+                            st.success(f"Submitted for approval. Request ID: {req_id}")
                         except Exception as e:
-                            st.error(f"Update failed: {e}")
+                            st.error(f"Submission failed: {e}")
         else:
             st.caption("Upload a roster file to bulk replace (validation rules TBD).")
             up = st.file_uploader("Roster (.xlsx) with 'Roster' sheet", type=["xlsx"], key="bulk_roster_up")
-            if st.button("Upload & Replace for this Center", type="primary", disabled=not up):
-                with overlay(f"Replacing roster for {center}…"):
+            if st.button("Upload & Validate (Pending)", type="primary", disabled=not up):
+                with overlay(f"Validating bulk file for {center}…"):
                     raw = read_roster_sheet(up.read())
                     if raw.empty:
                         st.error("No 'Roster' sheet found or it's empty.")
                     else:
-                        try:
-                            if DUCKDB_FILE_NAME:
-                                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                                if err or not local_db or not file_id:
-                                    st.error(f"DuckDB issue: {err or 'File not found.'}")
-                                else:
-                                    if "Date" not in raw or "Shift" not in raw:
-                                        st.error("File must contain at least 'Date' and 'Shift' columns.")
-                                    else:
-                                        raw["Center"] = center
-                                        raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                        inserted = duckdb_replace_roster_for_center(local_db, file_id, DUCKDB_FILE_NAME, raw, center)
-                                        st.success(f"Roster replaced for {center}. Rows after replace: {inserted}")
+                        # Ensure schema & coerce
+                        df = _ensure_roster_schema(raw)
+                        if "Date" in df.columns:
+                            df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+
+                        # 1) window
+                        werr = validate_window(start, end)
+                        if werr:
+                            st.error(werr);
+                            st.stop()
+
+                        # 2) exact date columns (for per-day columns like '06-Oct', '07-Oct', ...)
+                        #    If your bulk template uses one 'Date' column instead, we accept that too.
+                        wanted_dates = pd.date_range(start, end, freq="D").date
+                        per_day_headers = []
+                        for c in df.columns:
+                            # detect date-like headers (e.g., 06-Oct, 2024-10-06, 06/10, etc.)
+                            dtry = _parse_ddmm_header_to_date(c, start.year)
+                            if dtry: per_day_headers.append((c, dtry))
+
+                        if per_day_headers:
+                            header_dates = sorted([d for _, d in per_day_headers])
+                            if list(header_dates) != list(wanted_dates):
+                                st.error(
+                                    "Date-wise columns must exactly match the selected From–To range (no extra/missing days).")
+                                st.stop()
+
+                        # 3) row validations
+                        errors = []
+                        # get admin shift codes for validation
+                        if DUCKDB_FILE_NAME:
+                            local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                            con = duckdb.connect(local_db, read_only=True) if not err else None
+                        else:
+                            con = None
+
+                        def _val_shift(x):
+                            ok, why = validate_shift_value(_normalize_shift_label(x) or x, con)
+                            return (ok, why)
+
+                        for idx, r in df.iterrows():
+                            # Scope check
+                            if str(r.get("Center", "")).strip() not in (center, ""):
+                                errors.append((idx, "Center must equal your center"));
+                                continue
+
+                            # Allowed-values
+                            errors += [(idx, msg) for msg in validate_allowed_values(r.to_dict())]
+
+                            # Shift validation:
+                            if per_day_headers:
+                                for col, d in per_day_headers:
+                                    val = r.get(col, "")
+                                    ok, why = _val_shift(val)
+                                    if not ok:
+                                        errors.append((idx, f"{col}: {why}"))
                             else:
-                                cur = load_parquet_from_drive(ROSTER_FILE)
-                                raw["Center"] = center
-                                raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                if cur.empty:
-                                    save_parquet_to_drive(ROSTER_FILE, raw)
-                                else:
-                                    keep = cur[cur.get("Center","").astype(str) != center]
-                                    new_all = pd.concat([keep, raw], ignore_index=True)
-                                    save_parquet_to_drive(ROSTER_FILE, new_all)
-                                st.success(f"Roster replaced in Parquet for {center}. Rows added: {len(raw)}")
-                        except Exception as e:
-                            st.error(f"Bulk replace failed: {e}")
+                                val = r.get("Shift", "")
+                                ok, why = _val_shift(val)
+                                if not ok:
+                                    errors.append((idx, f"Shift: {why}"))
+
+                        if con is not None:
+                            try:
+                                con.close()
+                            except:
+                                pass
+
+                        if errors:
+                            st.error(f"Validation errors: {len(errors)}. Fix and retry.")
+                            # optional: show first 30 errors
+                            show = errors[:30]
+                            st.code("\n".join([f"Row {i}: {msg}" for i, msg in show]))
+                            st.stop()
+
+                        # Build items df for submission
+                        items = []
+                        if per_day_headers:
+                            for _, r in df.iterrows():
+                                agent = str(r.get("AgentID", "")).strip()
+                                for col, d in per_day_headers:
+                                    sh = _normalize_shift_label(r.get(col, "")) or str(r.get(col, "")).strip().upper()
+                                    items.append({
+                                        "AgentID": agent, "Date": d, "Shift": sh,
+                                        "TLName": r.get("TLName"), "Status": r.get("Status"),
+                                        "Language": r.get("Language"), "LOB": r.get("LOB"),
+                                        "WorkMode": r.get("WorkMode")
+                                    })
+                        else:
+                            # single 'Date' + 'Shift' format
+                            for _, r in df.iterrows():
+                                agent = str(r.get("AgentID", "")).strip()
+                                d = r.get("Date")
+                                if d is None or pd.isna(d): continue
+                                sh = _normalize_shift_label(r.get("Shift", "")) or str(
+                                    r.get("Shift", "")).strip().upper()
+                                items.append({
+                                    "AgentID": agent, "Date": d, "Shift": sh,
+                                    "TLName": r.get("TLName"), "Status": r.get("Status"),
+                                    "Language": r.get("Language"), "LOB": r.get("LOB"),
+                                    "WorkMode": r.get("WorkMode")
+                                })
+
+                        df_items = pd.DataFrame(items)
+                        if df_items.empty:
+                            st.warning("Nothing to submit after validation.");
+                            st.stop()
+
+                        req_id = submit_roster_request(
+                            mode="Bulk",
+                            center=center,
+                            uploaded_by=user.get("email", ""),
+                            from_date=start,
+                            to_date=end,
+                            items_df=df_items
+                        )
+                        st.success(f"Submitted for approval. Request ID: {req_id}")
 
     st.button("Edit / Update Roster", on_click=lambda: roster_edit_dialog(roster),
-              type="primary", disabled=not can_edit_this_center)
+              type="primary", disabled=not (can_edit_this_center and center_edit_ok))
 
 def render_admin_panel(all_centers_no_overall: list[str], ACL: dict, user_email: str):
-    st.subheader("🛡️ Admin — Center Access & Roster Upload")
-    st.markdown("### Center Access (Editors)")
+    st.subheader("🛡️ Admin")
+
+    # ===== Submissions queue =====
+    st.markdown("### Pending Submissions")
+    try:
+        local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+        if err or not local_db or not file_id:
+            st.info("DuckDB not configured; submissions view unavailable.")
+        else:
+            con = duckdb.connect(local_db, read_only=True)
+            _ensure_duckdb_schema(con)
+            pending = con.execute("""
+                SELECT request_id, mode, center, uploaded_by, from_date, to_date, status, reason, created_at
+                FROM submissions
+                WHERE status='Pending'
+                ORDER BY created_at DESC
+                LIMIT 200
+            """).df()
+            con.close()
+
+            if pending.empty:
+                st.caption("No pending submissions.")
+            else:
+                st.dataframe(pending, use_container_width=True, height=280)
+
+                with st.form("admin_action"):
+                    rid = st.text_input("Request ID")
+                    action = st.selectbox("Action", ["Approve","Deny"])
+                    reason = st.text_input("Reason (for Deny)")
+                    submitted = st.form_submit_button("Apply", type="primary")
+                if submitted and rid.strip():
+                    with overlay(f"{action} request…"):
+                        try:
+                            if action == "Approve":
+                                admin_approve_request(rid.strip(), user_email)
+                                st.success(f"Approved {rid}")
+                            else:
+                                admin_deny_request(rid.strip(), user_email, reason)
+                                st.warning(f"Denied {rid}")
+                            st.experimental_rerun()
+                        except Exception as e:
+                            st.error(f"Action failed: {e}")
+    except Exception as e:
+        st.error(f"Submissions section error: {e}")
+
+    st.markdown("---")
+
+    # ===== Center Edit Access =====
+    st.markdown("### Center Edit Access (ON/OFF)")
+    cA, cB = st.columns([1.1,1.9])
+    with cA:
+        center_sel = st.selectbox("Center", all_centers_no_overall, index=0 if all_centers_no_overall else None, key="perm_center_sel")
+    with cB:
+        if center_sel:
+            try:
+                local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+                if err or not local_db or not file_id:
+                    st.info("DuckDB not configured; skipping permissions.")
+                else:
+                    con = duckdb.connect(local_db, read_only=False)
+                    _ensure_duckdb_schema(con)
+                    row = con.execute("SELECT can_edit FROM center_permissions WHERE center=?", [center_sel]).df()
+                    can_edit = True if row.empty else bool(row.iloc[0]["can_edit"])
+                    toggle = st.toggle("Can Edit", value=can_edit)
+                    if st.button("Save Access", type="primary"):
+                        con.execute("""
+                            INSERT INTO center_permissions (center, can_edit) VALUES (?, ?)
+                            ON CONFLICT (center) DO UPDATE SET can_edit=excluded.can_edit
+                        """, [center_sel, toggle])
+                        _audit_log(con, "CenterAccessToggle", center_sel, user_email, f"can_edit={toggle}")
+                        st.success("Saved.")
+                    con.close()
+            except Exception as e:
+                st.error(f"Center access error: {e}")
+
+    st.markdown("---")
+
+    # ===== Shift Codes Manager =====
+    st.markdown("### Shift Codes (Admin-managed)")
+    st.caption("Use this to add non-time codes (e.g., FS) or time-bound codes with constraints.")
+    try:
+        local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
+        if err or not local_db or not file_id:
+            st.info("DuckDB not configured; skipping shift codes.")
+        else:
+            con = duckdb.connect(local_db, read_only=False)
+            _ensure_duckdb_schema(con)
+            df = con.execute("SELECT code, label, category, is_time_code, min_duration_minutes, notes, is_enabled FROM shift_codes ORDER BY code").df()
+            # Editable grid
+            edited = st.data_editor(
+                df if not df.empty else pd.DataFrame(columns=["code","label","category","is_time_code","min_duration_minutes","notes","is_enabled"]),
+                num_rows="dynamic",
+                use_container_width=True,
+                key="shift_codes_editor"
+            )
+            if st.button("Save Shift Codes", type="primary"):
+                with overlay("Saving shift codes…"):
+                    con.execute("DELETE FROM shift_codes")
+                    if not edited.empty:
+                        con.register("codes_src", edited)
+                        con.execute("""
+                            INSERT INTO shift_codes
+                            SELECT UPPER(code), label, category, COALESCE(is_time_code, FALSE),
+                                   NULLIF(min_duration_minutes, NULL), notes, COALESCE(is_enabled, TRUE)
+                            FROM codes_src
+                            WHERE TRIM(code) <> ''
+                        """)
+                    _audit_log(con, "ShiftCodesSave", "(all)", user_email, f"rows={0 if edited is None else len(edited)}")
+                    st.success("Saved shift codes.")
+            con.close()
+    except Exception as e:
+        st.error(f"Shift Codes error: {e}")
+
+    st.markdown("---")
+
+    # ===== Existing Editors management (your original UI) =====
+    st.markdown("### Center Editors (Legacy email-based)")
     colA, colB = st.columns([1.2, 1.8])
     with colA:
-        center_sel = st.selectbox("Center", all_centers_no_overall, index=0 if all_centers_no_overall else None)
-    if not center_sel:
+        center_sel2 = st.selectbox("Center (Editors)", all_centers_no_overall, index=0 if all_centers_no_overall else None)
+    if not center_sel2:
         st.info("No centers available.")
         return
-    editors = sorted(set((ACL.get(center_sel, {}).get("editors") or [])), key=str.lower)
+    editors = sorted(set((ACL.get(center_sel2, {}).get("editors") or [])), key=str.lower)
     with colB:
         st.write("**Current Editors**")
         if editors:
@@ -2236,9 +2741,9 @@ def render_admin_panel(all_centers_no_overall: list[str], ACL: dict, user_email:
                 c1, c2 = st.columns([6,1])
                 with c1: st.write(em)
                 with c2:
-                    if st.button("❌", key=f"rm_{center_sel}_{i}"):
+                    if st.button("❌", key=f"rm_{center_sel2}_{i}"):
                         new = set(editors); new.discard(em)
-                        ACL.setdefault(center_sel, {})["editors"] = sorted(new, key=str.lower)
+                        ACL.setdefault(center_sel2, {})["editors"] = sorted(new, key=str.lower)
                         _save_acl_to_drive(ACL, DRIVE_FOLDER_ID or None)
                         st.success(f"Removed {em}")
                         st.experimental_rerun()
@@ -2250,52 +2755,14 @@ def render_admin_panel(all_centers_no_overall: list[str], ACL: dict, user_email:
             if not new_email or "@" not in new_email:
                 st.warning("Enter a valid email.")
             else:
-                ACL.setdefault(center_sel, {}).setdefault("editors", [])
-                if new_email.lower() not in map(str.lower, ACL[center_sel]["editors"]):
-                    ACL[center_sel]["editors"].append(new_email)
+                ACL.setdefault(center_sel2, {}).setdefault("editors", [])
+                if new_email.lower() not in map(str.lower, ACL[center_sel2]["editors"]):
+                    ACL[center_sel2]["editors"].append(new_email)
                     _save_acl_to_drive(ACL, DRIVE_FOLDER_ID or None)
                     st.success(f"Added {new_email}")
                     st.experimental_rerun()
                 else:
                     st.info("Already present.")
-    st.markdown("---")
-    st.markdown("### Replace Roster for This Center Only")
-    st.caption("Upload a Roster workbook (.xlsx) with a 'Roster' sheet. Only rows for this center will be replaced.")
-    up = st.file_uploader(f"Roster file for {center_sel}", type=["xlsx"], key="admin_roster_up")
-    if st.button("Replace Roster for Center", type="primary", disabled=not up):
-        if not up:
-            st.warning("Select a file first.")
-        else:
-            raw = read_roster_sheet(up.read())
-            if raw.empty:
-                st.error("No 'Roster' sheet found or it's empty.")
-            else:
-                if DUCKDB_FILE_NAME:
-                    local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
-                    if err or not local_db or not file_id:
-                        st.error(f"DuckDB issue: {err or 'File not found.'}")
-                    else:
-                        try:
-                            if "Date" not in raw or "Shift" not in raw:
-                                st.error("Uploaded roster must have at least 'Date' and 'Shift' columns.")
-                            else:
-                                raw["Center"] = center_sel
-                                raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                                inserted = duckdb_replace_roster_for_center(local_db, file_id, DUCKDB_FILE_NAME, raw, center_sel)
-                                st.success(f"Roster replaced for {center_sel}. Rows now present for this center: {inserted}")
-                        except Exception as e:
-                            st.error(f"Center roster replace failed: {e}")
-                else:
-                    cur = load_parquet_from_drive(ROSTER_FILE)
-                    raw["Center"] = center_sel
-                    raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
-                    if cur.empty:
-                        save_parquet_to_drive(ROSTER_FILE, raw)
-                    else:
-                        keep = cur[cur.get("Center","").astype(str) != center_sel]
-                        new_all = pd.concat([keep, raw], ignore_index=True)
-                        save_parquet_to_drive(ROSTER_FILE, new_all)
-                    st.success(f"Roster replaced in Parquet for {center_sel}. Rows: {len(raw)}")
 
 # ------- Persistent tab switcher -------
 db = DBAdapter(records, roster, is_admin=is_admin, allowed_centers=allowed_centers, has_full_access=has_full_access)
