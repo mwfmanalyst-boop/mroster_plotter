@@ -184,7 +184,7 @@ input, textarea {
 .section-chip{
   display:block;                 /* make it fill horizontally */
   width:100%;
-  border-radius:9999px;
+  border-radius:999px;
   padding:12px 20px;
   font-weight:800;
   letter-spacing:.3px;
