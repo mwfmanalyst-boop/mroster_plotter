@@ -66,16 +66,20 @@ html, body, [class^="css"] {
 }
 
 /* Animated main gradient */
-.stApp {
-    background: linear-gradient(115deg, #667eea 0%, #764ba2 52%, #ff7eb3 100%);
-    background-size: 320% 320%;
-    animation: gradientMove 13s ease infinite;
-    min-height: 100vh;
-    padding: 28px 16px 48px 16px;
+/* Animated main gradient — slower & softer */
+.stApp{
+  background: linear-gradient(135deg, #5b67f1 0%, #7c3aed 35%, #ff7eb3 70%, #48cae4 100%);
+  background-size: 260% 260%;
+  animation: bgDrift 40s ease-in-out infinite;
+  min-height: 100vh;
+  padding: 28px 16px 48px 16px;
 }
-@keyframes gradientMove {
-    0%,100% {background-position: 0% 50%;}
-    50% {background-position: 100% 50%;}
+@keyframes bgDrift{
+  0%   { background-position: 0% 50%; }
+  25%  { background-position: 50% 0%; }
+  50%  { background-position: 100% 50%; }
+  75%  { background-position: 50% 100%; }
+  100% { background-position: 0% 50%; }
 }
 
 /* Modern tabs */
@@ -164,15 +168,34 @@ input, textarea {
     box-shadow: 0 1px 10px #764ba226;
 }
 
-/* Card title bold */
-.card h4, .card h3, .card h2, .card h1 {
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: #fff;
-    background: linear-gradient(90deg,#ff7eb3 0,#48cae4 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+/* Card titles: solid, readable */
+.card h4, .card h3, .card h2, .card h1{
+  font-weight: 800;
+  letter-spacing: .3px;
+  color:#ffffff;                 /* solid white text */
+  text-shadow: 0 2px 10px rgba(0,0,0,.25);
+  background: none;
+  -webkit-background-clip: initial;
+  -webkit-text-fill-color: initial;
 }
+
+/* Pill chips used for section headings */
+.section-chip{
+  display:inline-flex; align-items:center; justify-content:flex-start;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-weight: 800;
+  letter-spacing:.3px;
+  color:#fff;
+  box-shadow: 0 6px 24px rgba(0,0,0,.18), inset 0 0 0 1px rgba(255,255,255,.16);
+  text-shadow: 0 1px 8px rgba(0,0,0,.25);
+  backdrop-filter: blur(6px);
+}
+
+/* Color variants for the three sections */
+.chip-purple{ background: linear-gradient(135deg,#a78bfa 0%, #7c3aed 100%); }
+.chip-amber { background: linear-gradient(135deg,#fde68a 0%, #f59e0b 100%); color:#1f2937; text-shadow: none; }
+.chip-teal  { background: linear-gradient(135deg,#67e8f9 0%, #06b6d4 100%); }
 
 .block-container {
     max-width: 1400px;
@@ -1961,15 +1984,20 @@ def render_dashboard(view_type: str,
         st.subheader("📈 Shift-wise View")
         sub1, sub2, sub3 = st.columns(3)
         with sub1:
-            st.markdown("<div class='card'><h4>Requested – Shift-wise</h4>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><div class='section-chip chip-purple'>Requested – Shift-wise</div>",
+                        unsafe_allow_html=True)
             st.dataframe(req_shift_total, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
+
         with sub2:
-            st.markdown("<div class='card'><h4>Rostered – Shift-wise</h4>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><div class='section-chip chip-amber'>Rostered – Shift-wise</div>",
+                        unsafe_allow_html=True)
             st.dataframe(ros_shift_total, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
+
         with sub3:
-            st.markdown("<div class='card'><h4>Delta – Shift-wise</h4>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><div class='section-chip chip-teal'>Delta – Shift-wise</div>",
+                        unsafe_allow_html=True)
             st.dataframe(delt_shift_total, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1983,15 +2011,15 @@ def render_dashboard(view_type: str,
         delt_interval = ros_interval - req_interval
         i1, i2, i3 = st.columns(3)
         with i1:
-            st.markdown("<div class='card'><h4>Requested – Interval-wise</h4>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><div class='section-chip chip-purple'>Requested – Interval-wise</div>", unsafe_allow_html=True)
             st.dataframe(add_total_row(req_interval), use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
         with i2:
-            st.markdown("<div class='card'><h4>Rostered – Interval-wise</h4>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><div class='section-chip chip-amber'>Rostered – Interval-wise</div>", unsafe_allow_html=True)
             st.dataframe(add_total_row(ros_interval), use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
         with i3:
-            st.markdown("<div class='card'><h4>Delta – Interval-wise</h4>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><div class='section-chip chip-teal'>Delta – Interval-wise</div>", unsafe_allow_html=True)
             st.dataframe(add_total_row(delt_interval), use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
