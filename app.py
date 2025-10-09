@@ -180,16 +180,23 @@ input, textarea {
 }
 
 /* Pill chips used for section headings */
+/* Full-width capsule headers */
 .section-chip{
-  display:inline-flex; align-items:center; justify-content:flex-start;
-  border-radius: 999px;
-  padding: 8px 16px;
-  font-weight: 800;
+  display:block;                 /* make it fill horizontally */
+  width:100%;
+  border-radius:9999px;
+  padding:12px 20px;
+  font-weight:800;
   letter-spacing:.3px;
   color:#fff;
   box-shadow: 0 6px 24px rgba(0,0,0,.18), inset 0 0 0 1px rgba(255,255,255,.16);
   text-shadow: 0 1px 8px rgba(0,0,0,.25);
   backdrop-filter: blur(6px);
+}
+
+/* Optional: tighter look inside the card */
+.card .section-chip{
+  margin-bottom: 12px;           /* space below the capsule */
 }
 
 /* Color variants for the three sections */
