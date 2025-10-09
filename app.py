@@ -207,7 +207,7 @@ input, textarea {
   display:flex; flex-direction:column; justify-content:flex-start; 
   border-radius:22px; padding:18px 22px; min-height:110px;
   border:1px solid rgba(255,255,255,0.22);
-  box-shadow: 0 10px 36px rgba(31,38,135,0.18);
+  box-shadow: 0 28px 45px rgba(31,38,135,0.18);
   color:#fff;
   backdrop-filter: blur(10px);
 }
