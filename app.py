@@ -209,7 +209,7 @@ input, textarea {
   border:1px solid rgba(255,255,255,0.22);
   box-shadow: 0 28px 45px rgba(31,38,135,0.18);
   color:#fff;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(5px);
 }
 .kpi-label{
   font-size:14px; font-weight:700; letter-spacing:.3px; opacity:.92;
