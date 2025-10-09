@@ -183,6 +183,7 @@ input, textarea {
 .section-chip{
   display:inline-flex; align-items:center; justify-content:flex-start;
   border-radius: 999px;
+   width:100%;
   padding: 8px 16px;
   font-weight: 800;
   letter-spacing:.3px;
