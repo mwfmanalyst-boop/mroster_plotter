@@ -1013,21 +1013,21 @@ def admin_deny_request(request_id: str, actor_email: str, reason: str):
     load_from_duckdb.clear()
 def center_can_edit(center: str) -> bool:
     if not DUCKDB_FILE_NAME:
-        return True  # Parquet mode: keep current behavior
+        return True  # Parquet mode
     local_db, file_id, err = _download_duckdb_rw(DUCKDB_FILE_NAME)
     if err or not local_db or not file_id:
         return True
-    con = duckdb.connect(local_db, read_only=True)
+    con = duckdb.connect(local_db, read_only=False)  # writable for CREATE IF NOT EXISTS
     try:
         _ensure_duckdb_schema(con)
         df = con.execute("SELECT can_edit FROM center_permissions WHERE center = ?", [center]).df()
-        if df.empty:
-            return True
-        return bool(df.iloc[0]["can_edit"])
-    except Exception:
-        return True
+        can = True if df.empty else bool(df.iloc[0]["can_edit"])
     finally:
         con.close()
+        # persist any newly-created schema
+        _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
+        load_from_duckdb.clear()
+    return can
 
 # =========================
 # Parsing helpers (Requested workbook)
@@ -2619,7 +2619,7 @@ def render_admin_panel(all_centers_no_overall: list[str], ACL: dict, user_email:
         if err or not local_db or not file_id:
             st.info("DuckDB not configured; submissions view unavailable.")
         else:
-            con = duckdb.connect(local_db, read_only=True)
+            con = duckdb.connect(local_db, read_only=False)  # must be writable for CREATE IF NOT EXISTS
             _ensure_duckdb_schema(con)
             pending = con.execute("""
                 SELECT request_id, mode, center, uploaded_by, from_date, to_date, status, reason, created_at
@@ -2629,6 +2629,9 @@ def render_admin_panel(all_centers_no_overall: list[str], ACL: dict, user_email:
                 LIMIT 200
             """).df()
             con.close()
+
+            # If schema was just created, persist the DB back to Drive.
+            _upload_duckdb_back(local_db, file_id, DUCKDB_FILE_NAME)
 
             if pending.empty:
                 st.caption("No pending submissions.")
