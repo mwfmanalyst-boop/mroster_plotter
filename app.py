@@ -183,7 +183,7 @@ input, textarea {
 .section-chip{
   display:inline-flex; align-items:center; justify-content:flex-start;
   border-radius: 999px;
-   width:100%;
+  width:100%;
   padding: 8px 16px;
   font-weight: 800;
   letter-spacing:.3px;
@@ -209,7 +209,7 @@ input, textarea {
   border:1px solid rgba(255,255,255,0.22);
   box-shadow: 0 28px 45px rgba(31,38,135,0.18);
   color:#fff;
-  backdrop-filter: blur(5px);
+  backdrop-filter: blur(10px);
 }
 .kpi-label{
   font-size:14px; font-weight:700; letter-spacing:.3px; opacity:.92;
@@ -306,6 +306,7 @@ def _get_auth_config():
     cfg = st.secrets.get("auth", {})
     sso_roles = cfg.get("sso_roles", {})
     google = st.secrets.get("oauth", {}).get("google", {})
+    github = st.secrets.get("oauth", {}).get("github", {})
     return {
         "password_enabled": bool(cfg.get("enable_password_login", True)),
         "sso_enabled": bool(cfg.get("enable_sso_login", True)),
@@ -475,6 +476,85 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
             pass
 
     return {"name": name, "email": email, "role": _role(email), "auth": "sso"}
+def _sso_login_github(gh_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
+    """
+    GitHub SSO using OAuth Authorization Code + (optional) PKCE-like flow supported by streamlit_oauth.
+    Returns: {"name","email","role","auth":"sso"} or None
+    """
+    import requests, json, base64
+    st.markdown("### 🔓 Login with GitHub (SSO)")
+
+    client_id     = (gh_cfg.get("client_id") or "").strip()
+    client_secret = (gh_cfg.get("client_secret") or "").strip()
+    authorize_url = (gh_cfg.get("authorize_url") or "").strip()
+    token_url     = (gh_cfg.get("token_url") or "").strip()
+    user_info_url = (gh_cfg.get("user_info_url") or "").strip()   # https://api.github.com/user
+    emails_url    = (gh_cfg.get("emails_url") or "").strip()      # https://api.github.com/user/emails
+    redirect_uri  = (gh_cfg.get("redirect_uri") or gh_cfg.get("redirect_url") or "").strip()
+
+    if not all([client_id, client_secret, authorize_url, token_url, user_info_url, emails_url, redirect_uri]):
+        st.error("SSO not fully configured. Need client_id, client_secret, authorize_url, token_url, user_info_url, emails_url, redirect_uri in st.secrets['oauth']['github']")
+        return None
+
+    st.session_state.setdefault("_oauth_redirect_uri", redirect_uri)
+
+    try:
+        oauth2 = OAuth2Component(
+            client_id, client_secret, authorize_url,
+            token_url, token_url,
+            st.session_state["_oauth_redirect_uri"]
+        )
+    except TypeError as e:
+        st.error(f"OAuth2Component init failed: {e}")
+        return None
+
+    # Request the "read:user user:email" scopes so we can fetch primary email
+    try:
+        result = oauth2.authorize_button(
+            "Sign in with GitHub",
+            st.session_state["_oauth_redirect_uri"],
+            "read:user user:email",
+            key="github_oauth_btn",
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.error(f"authorize_button failed: {e}")
+        return None
+
+    if not result:
+        return None
+
+    token = result.get("token", result if isinstance(result, dict) else {}) or {}
+    access_token = token.get("access_token")
+    if not access_token:
+        st.error("SSO error: no access_token from GitHub.")
+        return None
+
+    # 1) Basic profile (login, name, avatar, etc.)
+    u = requests.get(user_info_url, headers={"Authorization": f"Bearer {access_token}",
+                                             "Accept": "application/json"}, timeout=10).json()
+    name = u.get("name") or u.get("login") or "User"
+
+    # 2) Emails endpoint to get primary/verified email
+    emails = requests.get(emails_url, headers={"Authorization": f"Bearer {access_token}",
+                                               "Accept": "application/json"}, timeout=10).json()
+    email = None
+    if isinstance(emails, list):
+        primary = [e for e in emails if e.get("primary")]
+        email = (primary[0]["email"] if primary else (emails[0]["email"] if emails else None))
+    if not email:
+        st.error("SSO error: could not obtain an email from GitHub (user may have no public email).")
+        return None
+
+    # Clear ?code&state to avoid reprocessing on rerun (same pattern as Google flow)
+    try:
+        st.query_params.clear()
+    except Exception:
+        try: st.experimental_set_query_params()
+        except Exception: pass
+
+    role = _role_from_sso_email(email, admin_domains, viewer_domains)
+    return {"name": name, "email": email, "role": role, "auth": "sso"}
 
 def _render_auth_gate():
     if "user" in st.session_state and st.session_state["user"]:
@@ -483,7 +563,7 @@ def _render_auth_gate():
     cfg = _get_auth_config()
     tabs = []
     if cfg["password_enabled"]: tabs.append("User/Password")
-    if cfg["sso_enabled"]: tabs.append("SSO (Google)")
+    if cfg["sso_enabled"]: tabs.append("SSO (GitHub)")
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Welcome — please sign in")
     t = st.tabs(tabs or ["Sign-in disabled"])
@@ -494,7 +574,7 @@ def _render_auth_gate():
         ti += 1
     if cfg["sso_enabled"]:
         with t[ti if len(t)>ti else -1]:
-            user = _sso_login_google(cfg["google"], cfg["admin_domains"], cfg["viewer_domains"]) or user
+            user = _sso_login_github(cfg["github"], cfg["admin_domains"], cfg["viewer_domains"]) or user
     st.markdown('</div>', unsafe_allow_html=True)
 
     if user:
