@@ -479,12 +479,13 @@ def _sso_login_google(google_cfg: dict, admin_domains: set[str], viewer_domains:
     return {"name": name, "email": email, "role": _role(email), "auth": "sso"}
 def _sso_login_github(gh_cfg: dict, admin_domains: set[str], viewer_domains: set[str]) -> dict | None:
     """
-    GitHub SSO using OAuth Authorization Code + (optional) PKCE-like flow supported by streamlit_oauth.
+    GitHub SSO using OAuth Authorization Code flow via streamlit_oauth.
     Returns: {"name","email","role","auth":"sso"} or None
     """
-    import requests, json, base64
+    import requests, time
     st.markdown("### 🔓 Login with GitHub (SSO)")
 
+    # ---- Required config (from st.secrets['oauth']['github'])
     client_id     = (gh_cfg.get("client_id") or "").strip()
     client_secret = (gh_cfg.get("client_secret") or "").strip()
     authorize_url = (gh_cfg.get("authorize_url") or "").strip()
@@ -493,26 +494,29 @@ def _sso_login_github(gh_cfg: dict, admin_domains: set[str], viewer_domains: set
     emails_url    = (gh_cfg.get("emails_url") or "").strip()      # https://api.github.com/user/emails
     redirect_uri  = (gh_cfg.get("redirect_uri") or gh_cfg.get("redirect_url") or "").strip()
 
-    if not all([client_id, client_secret, authorize_url, token_url, user_info_url, emails_url, redirect_uri]):
-        st.error("SSO not fully configured. Need client_id, client_secret, authorize_url, token_url, user_info_url, emails_url, redirect_uri in st.secrets['oauth']['github']")
+    need = [client_id, client_secret, authorize_url, token_url, user_info_url, emails_url, redirect_uri]
+    if not all(need):
+        st.error("GitHub SSO not configured. Missing one of: client_id, client_secret, authorize_url, token_url, user_info_url, emails_url, redirect_uri in st.secrets['oauth']['github']")
         return None
 
+    # Keep redirect stable across reruns (mirrors Google flow)
     st.session_state.setdefault("_oauth_redirect_uri", redirect_uri)
 
+    # ---- Build OAuth component
     try:
         oauth2 = OAuth2Component(
             client_id, client_secret, authorize_url,
-            token_url, token_url,
+            token_url, token_url,                 # token + refresh token
             st.session_state["_oauth_redirect_uri"]
         )
     except TypeError as e:
         st.error(f"OAuth2Component init failed: {e}")
         return None
 
-    # Request the "read:user user:email" scopes so we can fetch primary email
+    # Request "read:user user:email" so we can read primary email even if it's private
     try:
         result = oauth2.authorize_button(
-            "Sign in with GitHub",
+            "Continue with GitHub",
             st.session_state["_oauth_redirect_uri"],
             "read:user user:email",
             key="github_oauth_btn",
@@ -531,23 +535,24 @@ def _sso_login_github(gh_cfg: dict, admin_domains: set[str], viewer_domains: set
         st.error("SSO error: no access_token from GitHub.")
         return None
 
-    # 1) Basic profile (login, name, avatar, etc.)
-    u = requests.get(user_info_url, headers={"Authorization": f"Bearer {access_token}",
-                                             "Accept": "application/json"}, timeout=10).json()
+    H = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
+    # 1) Basic profile (login, name)
+    u = requests.get(user_info_url, headers=H, timeout=10).json()
     name = u.get("name") or u.get("login") or "User"
 
-    # 2) Emails endpoint to get primary/verified email
-    emails = requests.get(emails_url, headers={"Authorization": f"Bearer {access_token}",
-                                               "Accept": "application/json"}, timeout=10).json()
+    # 2) Emails endpoint — get primary/verified email
+    emails = requests.get(emails_url, headers=H, timeout=10).json()
     email = None
-    if isinstance(emails, list):
+    if isinstance(emails, list) and emails:
         primary = [e for e in emails if e.get("primary")]
-        email = (primary[0]["email"] if primary else (emails[0]["email"] if emails else None))
+        email = (primary[0]["email"] if primary else emails[0].get("email"))
+
     if not email:
-        st.error("SSO error: could not obtain an email from GitHub (user may have no public email).")
+        st.error("Could not obtain an email from GitHub (user may have no primary email).")
         return None
 
-    # Clear ?code&state to avoid reprocessing on rerun (same pattern as Google flow)
+    # Clear ?code&state to avoid reprocessing on rerun (mirrors Google)
     try:
         st.query_params.clear()
     except Exception:
