@@ -314,6 +314,7 @@ def _get_auth_config():
         "admin_domains": set(sso_roles.get("admin_domains", [])),
         "viewer_domains": set(sso_roles.get("viewer_domains", [])),
         "google": google,
+        "github": github,
     }
 
 def _domain_of(email: str) -> str:
@@ -574,7 +575,8 @@ def _render_auth_gate():
         ti += 1
     if cfg["sso_enabled"]:
         with t[ti if len(t)>ti else -1]:
-            user = _sso_login_github(cfg["github"], cfg["admin_domains"], cfg["viewer_domains"]) or user
+            gh_cfg = cfg.get("github") or {}
+            user = _sso_login_github(gh_cfg, cfg.get("admin_domains", set()), cfg.get("viewer_domains", set())) or user
     st.markdown('</div>', unsafe_allow_html=True)
 
     if user:
