@@ -561,36 +561,89 @@ def _sso_login_github(gh_cfg: dict, admin_domains: set[str], viewer_domains: set
 
     role = _role_from_sso_email(email, admin_domains, viewer_domains)
     return {"name": name, "email": email, "role": role, "auth": "sso"}
+# ---------- TOTP-only auth (no Google/GitHub/email) ----------
+import pyotp, qrcode
+
+def _qr_image(data: str):
+    img = qrcode.make(data)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def _get_user_record(email: str) -> dict | None:
+    st.session_state.setdefault("users", {})
+    return st.session_state["users"].get((email or "").lower())
+
+def _save_user_record(email: str, rec: dict):
+    st.session_state.setdefault("users", {})
+    st.session_state["users"][(email or "").lower()] = rec
+
+def _infer_role_from_email(email: str, admin_domains: set[str], viewer_domains: set[str]) -> str:
+    try:
+        return _role_from_sso_email(email, admin_domains, viewer_domains)
+    except Exception:
+        return "viewer"
+
+def render_totp_enroll(admin_domains: set[str], viewer_domains: set[str]):
+    st.markdown("### 🆕 Enroll")
+    email = st.text_input("Email", key="enroll_email", placeholder="you@example.com")
+    if st.button("Create my authenticator setup", use_container_width=True):
+        if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email or ""):
+            st.error("Enter a valid email.")
+            return
+        if _get_user_record(email):
+            st.info("Already enrolled. Go to Login.")
+            return
+        secret = pyotp.random_base32()
+        role   = _infer_role_from_email(email, admin_domains, viewer_domains)
+        _save_user_record(email, {"email": email, "totp_secret": secret, "role": role})
+        issuer = (st.secrets.get("totp", {}) or {}).get("issuer", "YourApp")
+        uri = pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name=issuer)
+        st.caption("Scan this QR in your authenticator app (Google/Microsoft Authenticator, etc.)")
+        st.image(_qr_image(uri))
+        st.code(f"Or enter this secret manually: {secret}", language="text")
+        st.success("Enrollment complete. Now open the Login tab and enter a 6-digit code.")
+
+def render_totp_login() -> dict | None:
+    st.markdown("### 🔐 Login")
+    email = st.text_input("Email", key="login_email", placeholder="you@example.com")
+    code  = st.text_input("6-digit code from your authenticator", max_chars=6, type="password", key="login_code")
+    if st.button("Sign in", use_container_width=True):
+        rec = _get_user_record(email)
+        if not rec or not rec.get("totp_secret"):
+            st.error("No TOTP enrollment found for this email. Go to Enroll.")
+            return None
+        totp = pyotp.TOTP(rec["totp_secret"])
+        if totp.verify(code, valid_window=1):
+            return {"name": (email.split("@")[0] if "@" in email else email), "email": email, "auth": "totp", "role": rec.get("role","viewer")}
+        else:
+            st.error("Invalid code.")
+    return None
+
+def render_totp_auth_gate(admin_domains: set[str], viewer_domains: set[str]):
+    tabs = st.tabs(["Enroll", "Login"])
+    with tabs[0]:
+        render_totp_enroll(admin_domains, viewer_domains)
+    with tabs[1]:
+        user = render_totp_login()
+        if user:
+            st.session_state["user"] = user
+            st.success(f"Welcome {user['email']}!")
+            st.rerun()
+# -------------------------------------------------------------
 
 def _render_auth_gate():
     if "user" in st.session_state and st.session_state["user"]:
         return st.session_state["user"]
 
     cfg = _get_auth_config()
-    tabs = []
-    if cfg["password_enabled"]: tabs.append("User/Password")
-    if cfg["sso_enabled"]: tabs.append("SSO (GitHub)")
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Welcome — please sign in")
-    t = st.tabs(tabs or ["Sign-in disabled"])
 
-    user = None; ti = 0
-    if cfg["password_enabled"]:
-        with t[ti]: user = _password_login_form(cfg["password_users"]) or user
-        ti += 1
-    if cfg["sso_enabled"]:
-        with t[ti if len(t)>ti else -1]:
-            gh_cfg = cfg.get("github") or {}
-            user = _sso_login_github(gh_cfg, cfg.get("admin_domains", set()), cfg.get("viewer_domains", set())) or user
+    # TOTP-only login (no Google/GitHub)
+    render_totp_auth_gate(cfg.get("admin_domains", set()), cfg.get("viewer_domains", set()))
     st.markdown('</div>', unsafe_allow_html=True)
-
-    if user:
-        st.session_state["user"] = user
-        st.success(f"Hello, {user['name']}!")
-        st.rerun()
     st.stop()
-
-ACL_FILE_NAME = st.secrets.get("ACL_FILE_NAME", "center_acl.json")
 
 @st.cache_resource
 def _get_drive_service():
