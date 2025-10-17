@@ -4,6 +4,8 @@ import json
 import tempfile
 from datetime import date, timedelta, datetime
 from typing import Optional, Tuple, List, Dict
+import sqlite3, os
+import io  # if not already imported (needed for QR PNG buffer)
 
 import numpy as np
 import pandas as pd
@@ -562,31 +564,73 @@ def _sso_login_github(gh_cfg: dict, admin_domains: set[str], viewer_domains: set
     role = _role_from_sso_email(email, admin_domains, viewer_domains)
     return {"name": name, "email": email, "role": role, "auth": "sso"}
 # ---------- TOTP-only auth (no Google/GitHub/email) ----------
+import time, re
+import streamlit as st
 import pyotp, qrcode
+from io import BytesIO
+
+# ---- Persistent storage (SQLite) --------------------------------------------
+DB_PATH = os.path.join(os.getcwd(), "totp_users.db")
+
+def _db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            totp_secret TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created INTEGER NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+if "totp_db_conn" not in st.session_state:
+    st.session_state["totp_db_conn"] = _db_conn()
+
+def _get_user_record(email: str) -> dict | None:
+    email_key = (email or "").strip().lower()
+    cur = st.session_state["totp_db_conn"].execute(
+        "SELECT email, totp_secret, role, created FROM users WHERE email = ?", (email_key,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"email": row[0], "totp_secret": row[1], "role": row[2], "created": row[3]}
+
+def _save_user_record(email: str, rec: dict):
+    email_key = (email or "").strip().lower()
+    st.session_state["totp_db_conn"].execute(
+        "INSERT OR REPLACE INTO users (email, totp_secret, role, created) VALUES (?, ?, ?, ?)",
+        (email_key, rec["totp_secret"], rec.get("role","viewer"), rec.get("created", int(time.time())))
+    )
+    st.session_state["totp_db_conn"].commit()
+# -----------------------------------------------------------------------------
+
+ISSUER = (st.secrets.get("totp", {}) or {}).get("issuer", "YourApp")
 
 def _qr_image(data: str):
     img = qrcode.make(data)
-    buf = io.BytesIO()
+    buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def _get_user_record(email: str) -> dict | None:
-    st.session_state.setdefault("users", {})
-    return st.session_state["users"].get((email or "").lower())
-
-def _save_user_record(email: str, rec: dict):
-    st.session_state.setdefault("users", {})
-    st.session_state["users"][(email or "").lower()] = rec
-
-def _infer_role_from_email(email: str, admin_domains: set[str], viewer_domains: set[str]) -> str:
+def _infer_role_from_email(email: str) -> str:
+    # Reuse your domain->role mapping if present in secrets
     try:
-        return _role_from_sso_email(email, admin_domains, viewer_domains)
+        domain = (email.split("@", 1)[1] if "@" in email else "").lower()
+        roles = (st.secrets.get("auth", {}) or {}).get("sso_roles", {}) or {}
+        if domain in set(roles.get("admin_domains", [])):  return "admin"
+        if domain in set(roles.get("viewer_domains", [])): return "viewer"
     except Exception:
-        return "viewer"
+        pass
+    return "viewer"
 
-def render_totp_enroll(admin_domains: set[str], viewer_domains: set[str]):
+# ===== Enroll (one-time) =====
+def render_totp_enroll():
     st.markdown("### 🆕 Enroll")
     email = st.text_input("Email", key="enroll_email", placeholder="you@example.com")
+
     if st.button("Create my authenticator setup", use_container_width=True):
         if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email or ""):
             st.error("Enter a valid email.")
@@ -594,36 +638,67 @@ def render_totp_enroll(admin_domains: set[str], viewer_domains: set[str]):
         if _get_user_record(email):
             st.info("Already enrolled. Go to Login.")
             return
+
         secret = pyotp.random_base32()
-        role   = _infer_role_from_email(email, admin_domains, viewer_domains)
-        _save_user_record(email, {"email": email, "totp_secret": secret, "role": role})
-        issuer = (st.secrets.get("totp", {}) or {}).get("issuer", "YourApp")
-        uri = pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name=issuer)
+        role   = _infer_role_from_email(email)
+        _save_user_record(email, {
+            "totp_secret": secret,
+            "role": role,
+            "created": int(time.time()),
+        })
+
+        uri = pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name=ISSUER)
         st.caption("Scan this QR in your authenticator app (Google/Microsoft Authenticator, etc.)")
         st.image(_qr_image(uri))
         st.code(f"Or enter this secret manually: {secret}", language="text")
         st.success("Enrollment complete. Now open the Login tab and enter a 6-digit code.")
 
+# ===== Login (every time) =====
 def render_totp_login() -> dict | None:
     st.markdown("### 🔐 Login")
     email = st.text_input("Email", key="login_email", placeholder="you@example.com")
     code  = st.text_input("6-digit code from your authenticator", max_chars=6, type="password", key="login_code")
+
+    # Basic throttling memory (optional)
+    st.session_state.setdefault("totp_attempts", {})
+    key = (email or "").lower()
+    attempts = st.session_state["totp_attempts"].get(key, {"count": 0, "ts": 0})
+
     if st.button("Sign in", use_container_width=True):
         rec = _get_user_record(email)
         if not rec or not rec.get("totp_secret"):
             st.error("No TOTP enrollment found for this email. Go to Enroll.")
             return None
+
+        # Simple rate-limit: 5 attempts per 30s window
+        now = int(time.time())
+        if attempts["count"] >= 5 and (now - attempts["ts"] <= 30):
+            st.error("Too many attempts. Please wait a moment.")
+            return None
+
         totp = pyotp.TOTP(rec["totp_secret"])
-        if totp.verify(code, valid_window=1):
-            return {"name": (email.split("@")[0] if "@" in email else email), "email": email, "auth": "totp", "role": rec.get("role","viewer")}
+        ok = totp.verify(code, valid_window=1)  # small clock drift tolerance
+
+        if ok:
+            st.session_state["totp_attempts"][key] = {"count": 0, "ts": now}
+            return {
+                "name": (email.split("@")[0] if "@" in email else email),
+                "email": email,
+                "auth": "totp",
+                "role": rec.get("role","viewer")
+            }
         else:
+            attempts["count"] = 1 if (now - attempts["ts"] > 30) else attempts["count"] + 1
+            attempts["ts"] = now
+            st.session_state["totp_attempts"][key] = attempts
             st.error("Invalid code.")
     return None
 
-def render_totp_auth_gate(admin_domains: set[str], viewer_domains: set[str]):
+# ===== Gate wrapper =====
+def render_totp_auth_gate():
     tabs = st.tabs(["Enroll", "Login"])
     with tabs[0]:
-        render_totp_enroll(admin_domains, viewer_domains)
+        render_totp_enroll()
     with tabs[1]:
         user = render_totp_login()
         if user:
@@ -636,13 +711,11 @@ def _render_auth_gate():
     if "user" in st.session_state and st.session_state["user"]:
         return st.session_state["user"]
 
-    cfg = _get_auth_config()
-    st.markdown('<div class="card">', unsafe_allow_html=True)
+    cfg = _get_auth_config()  # kept in case you still use role domains, etc.
     st.subheader("Welcome — please sign in")
 
     # TOTP-only login (no Google/GitHub)
-    render_totp_auth_gate(cfg.get("admin_domains", set()), cfg.get("viewer_domains", set()))
-    st.markdown('</div>', unsafe_allow_html=True)
+    render_totp_auth_gate()
     st.stop()
 
 @st.cache_resource
